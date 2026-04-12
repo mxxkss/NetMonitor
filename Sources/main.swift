@@ -1,6 +1,7 @@
 import Cocoa
 import Darwin
 import CoreWLAN
+import Security
 
 // MARK: - Network
 
@@ -183,42 +184,61 @@ func getWiFiInfo() -> WiFiInfo? {
 
 // MARK: - Render menu bar image
 
-func renderStatusImage(up: String, down: String, dateStr: String, timeStr: String, height: CGFloat) -> NSImage {
+func renderStatusImage(up: String, down: String, dateStr: String,
+                       h: Int, m: Int, s: Int, colonVisible: Bool, height: CGFloat) -> NSImage {
     let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
     let dateFont  = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
     let timeFont  = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .medium)
-    let black: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black]
 
-    let speedAttrs = black.merging([.font: speedFont]) { $1 }
-    let dateAttrs  = black.merging([.font: dateFont]) { $1 }
-    let timeAttrs  = black.merging([.font: timeFont]) { $1 }
+    let speedAttrs: [NSAttributedString.Key: Any] = [.font: speedFont, .foregroundColor: NSColor.black]
+    let dateAttrs:  [NSAttributedString.Key: Any] = [.font: dateFont,  .foregroundColor: NSColor.black]
+    let timeAttrs:  [NSAttributedString.Key: Any] = [.font: timeFont,  .foregroundColor: NSColor.black]
+    let colonColor = colonVisible ? NSColor.black : NSColor.clear
+    let colonAttrs: [NSAttributedString.Key: Any] = [.font: timeFont,  .foregroundColor: colonColor]
 
     let upStr   = "\u{2191} \(up)"
     let downStr = "\u{2193} \(down)"
 
-    let upSize   = (upStr as NSString).size(withAttributes: speedAttrs)
-    let downSize = (downStr as NSString).size(withAttributes: speedAttrs)
-    let dateSize = (dateStr as NSString).size(withAttributes: dateAttrs)
-    let timeSize = (timeStr as NSString).size(withAttributes: timeAttrs)
+    let upSize    = (upStr as NSString).size(withAttributes: speedAttrs)
+    let downSize  = (downStr as NSString).size(withAttributes: speedAttrs)
+    let dateSize  = (dateStr as NSString).size(withAttributes: dateAttrs)
+    let digitSize = ("00" as NSString).size(withAttributes: timeAttrs)
+    let colonSize = (":" as NSString).size(withAttributes: timeAttrs)
 
     let speedW = max(upSize.width, downSize.width)
-    let gap: CGFloat = 4
-    let totalW = ceil(speedW + gap + dateSize.width + 3 + timeSize.width)
+    let gap: CGFloat = 8
+    let timeW = digitSize.width * 3 + colonSize.width * 2
+    let totalW = ceil(speedW + gap + dateSize.width + 6 + timeW)
 
     let img = NSImage(size: NSSize(width: totalW, height: height))
     img.lockFocus()
 
+    // Speed: upload top, download bottom
     let lineH = height / 2
     (upStr as NSString).draw(at: NSPoint(x: 0, y: lineH + 1), withAttributes: speedAttrs)
     (downStr as NSString).draw(at: NSPoint(x: 0, y: 1), withAttributes: speedAttrs)
 
+    // Date
     let dtX = speedW + gap
     let dateY = (height - dateSize.height) / 2
     (dateStr as NSString).draw(at: NSPoint(x: dtX, y: dateY), withAttributes: dateAttrs)
 
-    let timeX = dtX + dateSize.width + 3
-    let timeY = (height - timeSize.height) / 2
-    (timeStr as NSString).draw(at: NSPoint(x: timeX, y: timeY), withAttributes: timeAttrs)
+    // Time: draw HH : MM : SS at fixed positions (colon blinks via color)
+    let timeY = (height - digitSize.height) / 2
+    var tx = dtX + dateSize.width + 6
+    let hh = String(format: "%02d", h)
+    let mm = String(format: "%02d", m)
+    let ss = String(format: "%02d", s)
+
+    (hh as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
+    tx += digitSize.width
+    (":" as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: colonAttrs)
+    tx += colonSize.width
+    (mm as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
+    tx += digitSize.width
+    (":" as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: colonAttrs)
+    tx += colonSize.width
+    (ss as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
 
     img.unlockFocus()
     img.isTemplate = true
@@ -245,6 +265,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var txTotalItem: NSMenuItem!
     private var diskItem: NSMenuItem!
     private var uptimeItem: NSMenuItem!
+    private var claude5hItem: NSMenuItem!
+    private var claude7dItem: NSMenuItem!
     private var currentExtIP = ""
 
     private let dateFmt: DateFormatter = {
@@ -261,7 +283,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         startMonitoring()
         fetchGeoIP()
+        fetchClaudeUsage()
         Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.fetchGeoIP() }
+        Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in self?.fetchClaudeUsage() }
     }
 
     private func buildMenu() {
@@ -344,6 +368,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // Claude Usage
+        let claudeHeader = NSMenuItem(title: "Claude Code", action: nil, keyEquivalent: "")
+        claudeHeader.isEnabled = false
+        menu.addItem(claudeHeader)
+
+        claude5hItem = NSMenuItem(title: "  5h limit:  ...", action: nil, keyEquivalent: "")
+        claude5hItem.isEnabled = false
+        menu.addItem(claude5hItem)
+
+        claude7dItem = NSMenuItem(title: "  7d limit:  ...", action: nil, keyEquivalent: "")
+        claude7dItem.isEnabled = false
+        menu.addItem(claude7dItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         let termItem = NSMenuItem(title: "Terminal", action: #selector(openTerminal), keyEquivalent: "t")
         termItem.target = self
         menu.addItem(termItem)
@@ -389,13 +428,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Time with blinking colons
         colonVisible.toggle()
         let cal = Calendar.current
-        let h = cal.component(.hour, from: now)
-        let m = cal.component(.minute, from: now)
-        let s = cal.component(.second, from: now)
-        let sep = colonVisible ? ":" : " "
-        let timeStr = String(format: "%02d%@%02d%@%02d", h, sep, m, sep, s)
+        let hr = cal.component(.hour, from: now)
+        let mn = cal.component(.minute, from: now)
+        let sc = cal.component(.second, from: now)
 
-        let img = renderStatusImage(up: upStr, down: downStr, dateStr: dateStr, timeStr: timeStr, height: barHeight)
+        let img = renderStatusImage(up: upStr, down: downStr, dateStr: dateStr,
+                                    h: hr, m: mn, s: sc, colonVisible: colonVisible, height: barHeight)
         statusItem.button?.image = img
 
         // CPU
@@ -428,6 +466,83 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         ipMenuItem.title = "Local IP: \(getLocalIP())"
         prevSnapshot = snap
+    }
+
+    private func getClaudeToken() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String
+        else { return nil }
+        return token
+    }
+
+    private func fetchClaudeUsage() {
+        guard let token = getClaudeToken(),
+              let url = URL(string: "https://api.anthropic.com/api/oauth/usage")
+        else {
+            DispatchQueue.main.async {
+                self.claude5hItem.title = "  5h limit:  No Claude Code auth"
+                self.claude7dItem.title = "  7d limit:  —"
+            }
+            return
+        }
+
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.setValue("NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data = data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return }
+
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            fmt.timeZone = TimeZone.current
+
+            DispatchQueue.main.async {
+                if let fiveH = j["five_hour"] as? [String: Any],
+                   let util5 = fiveH["utilization"] as? Double {
+                    var reset5 = ""
+                    if let r = fiveH["resets_at"] as? String {
+                        let isoFmt = DateFormatter()
+                        isoFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZZZZZ"
+                        if let d = isoFmt.date(from: r) {
+                            let rf = DateFormatter()
+                            rf.dateFormat = "HH:mm"
+                            reset5 = "  (reset \(rf.string(from: d)))"
+                        }
+                    }
+                    self?.claude5hItem.title = String(format: "  5h limit:  %.0f%%%@", util5, reset5)
+                }
+
+                if let sevenD = j["seven_day"] as? [String: Any],
+                   let util7 = sevenD["utilization"] as? Double {
+                    var reset7 = ""
+                    if let r = sevenD["resets_at"] as? String {
+                        let isoFmt = DateFormatter()
+                        isoFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZZZZZ"
+                        if let d = isoFmt.date(from: r) {
+                            let rf = DateFormatter()
+                            rf.locale = Locale(identifier: "ru_RU")
+                            rf.dateFormat = "d MMM HH:mm"
+                            reset7 = "  (reset \(rf.string(from: d)))"
+                        }
+                    }
+                    self?.claude7dItem.title = String(format: "  7d limit:  %.0f%%%@", util7, reset7)
+                }
+            }
+        }.resume()
     }
 
     private func fetchGeoIP() {

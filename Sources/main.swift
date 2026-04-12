@@ -538,35 +538,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func claudeLogin() {
         let alert = NSAlert()
         alert.messageText = "Claude Session Key"
-        alert.informativeText = "1. Open claude.ai in Safari\n2. F12 → Application → Cookies → claude.ai\n3. Copy 'sessionKey' value (sk-ant-sid...)\n\nAlso enter your Organization ID from the URL:\nclaude.ai/settings → look at URL for org ID"
+        alert.informativeText = "1. Open claude.ai in Safari, log in\n2. Safari menu → Develop → Show Web Inspector\n   (enable in Safari → Settings → Advanced first)\n3. Tab \"Storage\" → Cookies → claude.ai\n4. Copy \"sessionKey\" value (sk-ant-sid...)\n\nOrg ID will be detected automatically."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Logout")
 
-        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 340, height: 52))
-        stack.orientation = .vertical
-        stack.spacing = 4
-
         let keyField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         keyField.placeholderString = "sk-ant-sid01-..."
         keyField.stringValue = keychainLoad(key: "sessionKey") ?? ""
-
-        let orgField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        orgField.placeholderString = "org ID (from URL)"
-        orgField.stringValue = keychainLoad(key: "orgId") ?? ""
-
-        stack.addArrangedSubview(keyField)
-        stack.addArrangedSubview(orgField)
-        alert.accessoryView = stack
+        alert.accessoryView = keyField
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
             let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
-            let org = orgField.stringValue.trimmingCharacters(in: .whitespaces)
-            if !key.isEmpty && !org.isEmpty {
+            if !key.isEmpty {
                 keychainSave(key: "sessionKey", value: key)
-                keychainSave(key: "orgId", value: org)
-                fetchClaudeUsage()
+                // Auto-fetch orgId then usage
+                fetchOrgIdAndUsage(sessionKey: key)
             }
         } else if response == .alertThirdButtonReturn {
             keychainDelete(key: "sessionKey")
@@ -574,6 +562,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             claude5hItem.title = "Claude 5h: —"
             claude7dItem.title = "Claude 7d: —"
         }
+    }
+
+    private func fetchOrgIdAndUsage(sessionKey: String) {
+        guard let url = URL(string: "https://claude.ai/api/organizations") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("sessionKey=\(sessionKey)", forHTTPHeaderField: "Cookie")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data = data,
+                  let orgs = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                  let first = orgs.first,
+                  let orgId = first["uuid"] as? String
+            else {
+                DispatchQueue.main.async { self?.claude5hItem.title = "Claude 5h: Bad key" }
+                return
+            }
+            keychainSave(key: "orgId", value: orgId)
+            self?.fetchClaudeUsage()
+        }.resume()
     }
 
     private func fetchClaudeUsage() {

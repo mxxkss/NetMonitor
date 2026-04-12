@@ -80,10 +80,48 @@ func formatBytes(_ bytes: UInt64) -> String {
     return String(format: "%.1f MB", mb)
 }
 
+// MARK: - Two-line status view
+
+class StatusView: NSView {
+    private let topLabel = NSTextField(labelWithString: "")
+    private let bottomLabel = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        for label in [topLabel, bottomLabel] {
+            label.font = font
+            label.textColor = .headerTextColor
+            label.alignment = .right
+            label.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(label)
+        }
+        NSLayoutConstraint.activate([
+            topLabel.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            topLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            topLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+            bottomLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+            bottomLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            bottomLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+        update(down: "...", up: "...")
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func update(down: String, up: String) {
+        topLabel.stringValue = "\u{2193} \(down)"
+        bottomLabel.stringValue = "\u{2191} \(up)"
+        let maxW = max(topLabel.intrinsicContentSize.width, bottomLabel.intrinsicContentSize.width)
+        frame.size.width = maxW + 4
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    private var statusView: StatusView!
     private var timer: Timer?
     private var prevSnapshot: NetworkSnapshot?
 
@@ -94,9 +132,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        statusItem.button?.title = "Net: ..."
+        let barHeight = NSStatusBar.system.thickness
+        statusItem = NSStatusBar.system.statusItem(withLength: 75)
+        statusView = StatusView(frame: NSRect(x: 0, y: 0, width: 75, height: barHeight))
+        statusItem.button?.addSubview(statusView)
+        statusView.frame = statusItem.button!.bounds
+        statusView.autoresizingMask = [.width, .height]
 
         buildMenu()
         startMonitoring()
@@ -155,7 +196,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let rxSpeed = Double(current.rx - prev.rx) / dt
             let txSpeed = Double(current.tx - prev.tx) / dt
 
-            statusItem.button?.title = "\u{2193}\(formatSpeed(rxSpeed))  \u{2191}\(formatSpeed(txSpeed))"
+            statusView.update(down: formatSpeed(rxSpeed), up: formatSpeed(txSpeed))
 
             rxTotalItem.title = "Total In:  \(formatBytes(current.rx))"
             txTotalItem.title = "Total Out: \(formatBytes(current.tx))"

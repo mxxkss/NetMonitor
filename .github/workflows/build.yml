@@ -1,0 +1,34 @@
+name: Build NetMonitor
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14  # Apple Silicon M1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          swiftc -O -target arm64-apple-macos12.0 \
+            -o NetMonitor Sources/main.swift
+
+      - name: Create .app bundle
+        run: |
+          mkdir -p NetMonitor.app/Contents/MacOS
+          mkdir -p NetMonitor.app/Contents/Resources
+          mv NetMonitor NetMonitor.app/Contents/MacOS/
+          cp Info.plist NetMonitor.app/Contents/
+
+      - name: Zip .app
+        run: zip -r NetMonitor.zip NetMonitor.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetMonitor
+          path: NetMonitor.zip

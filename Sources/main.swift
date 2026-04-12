@@ -2,6 +2,7 @@ import Cocoa
 import Darwin
 import CoreWLAN
 import Security
+import IOKit
 
 // MARK: - Network
 
@@ -73,85 +74,97 @@ func countryFlag(_ code: String) -> String {
     }.map { Character($0) })
 }
 
-// MARK: - System info
+// MARK: - CPU Monitor (delta-based, exelban/stats pattern)
 
-func getCPUUsage() -> Double {
-    var loadInfo = host_cpu_load_info_data_t()
-    var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
-    let result = withUnsafeMutablePointer(to: &loadInfo) {
-        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-            host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+class CPUMonitor {
+    private var prevTicks = host_cpu_load_info_data_t()
+    private var prevPerCore: [(user: UInt32, sys: UInt32, idle: UInt32, nice: UInt32)] = []
+
+    func totalUsage() -> Double {
+        var info = host_cpu_load_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let r = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
         }
-    }
-    guard result == KERN_SUCCESS else { return 0 }
-    let user = Double(loadInfo.cpu_ticks.0)
-    let sys  = Double(loadInfo.cpu_ticks.1)
-    let idle = Double(loadInfo.cpu_ticks.2)
-    let nice = Double(loadInfo.cpu_ticks.3)
-    let total = user + sys + idle + nice
-    return total > 0 ? ((user + sys + nice) / total) * 100 : 0
-}
+        guard r == KERN_SUCCESS else { return 0 }
 
-struct PerCoreCPU {
-    let usage: [Double] // percentage per logical core
-}
+        let user   = Double(info.cpu_ticks.0 &- prevTicks.cpu_ticks.0)
+        let system = Double(info.cpu_ticks.1 &- prevTicks.cpu_ticks.1)
+        let idle   = Double(info.cpu_ticks.2 &- prevTicks.cpu_ticks.2)
+        let nice   = Double(info.cpu_ticks.3 &- prevTicks.cpu_ticks.3)
+        prevTicks = info
 
-func getPerCoreCPU() -> PerCoreCPU {
-    let numCPU = Int32(ProcessInfo.processInfo.processorCount)
-    var cpuInfo: processor_info_array_t?
-    var numCPUInfo: mach_msg_type_number_t = 0
-    var numCPUs: natural_t = 0
-
-    let result = host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &numCPUs, &cpuInfo, &numCPUInfo)
-    guard result == KERN_SUCCESS, let info = cpuInfo else { return PerCoreCPU(usage: []) }
-
-    var usages: [Double] = []
-    for i in 0..<Int(numCPUs) {
-        let offset = Int(CPU_STATE_MAX) * i
-        let user   = Double(info[offset + Int(CPU_STATE_USER)])
-        let sys    = Double(info[offset + Int(CPU_STATE_SYSTEM)])
-        let idle   = Double(info[offset + Int(CPU_STATE_IDLE)])
-        let nice   = Double(info[offset + Int(CPU_STATE_NICE)])
-        let total = user + sys + idle + nice
-        let pct = total > 0 ? ((user + sys + nice) / total) * 100 : 0
-        usages.append(pct)
+        let total = user + system + idle + nice
+        return total > 0 ? ((user + system) / total) * 100 : 0
     }
 
-    let size = Int(numCPUInfo) * MemoryLayout<integer_t>.size
-    vm_deallocate(mach_task_self_, vm_address_t(bitPattern: info), vm_size_t(size))
+    func perCoreUsage() -> [Double] {
+        var cpuCount: natural_t = 0
+        var infoArray: processor_info_array_t?
+        var infoCount: mach_msg_type_number_t = 0
 
-    return PerCoreCPU(usage: usages)
+        let r = host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &cpuCount, &infoArray, &infoCount)
+        guard r == KERN_SUCCESS, let info = infoArray else { return [] }
+        defer { vm_deallocate(mach_task_self_, vm_address_t(bitPattern: info), vm_size_t(infoCount) * vm_size_t(MemoryLayout<integer_t>.size)) }
+
+        var usages: [Double] = []
+        for i in 0..<Int(cpuCount) {
+            let off = Int(CPU_STATE_MAX) * i
+            let cur = (user: UInt32(info[off + Int(CPU_STATE_USER)]),
+                       sys: UInt32(info[off + Int(CPU_STATE_SYSTEM)]),
+                       idle: UInt32(info[off + Int(CPU_STATE_IDLE)]),
+                       nice: UInt32(info[off + Int(CPU_STATE_NICE)]))
+
+            if i < prevPerCore.count {
+                let prev = prevPerCore[i]
+                let u = Double(cur.user &- prev.user)
+                let s = Double(cur.sys &- prev.sys)
+                let id = Double(cur.idle &- prev.idle)
+                let n = Double(cur.nice &- prev.nice)
+                let t = u + s + id + n
+                usages.append(t > 0 ? ((u + s) / t) * 100 : 0)
+            } else {
+                usages.append(0)
+            }
+        }
+
+        prevPerCore = (0..<Int(cpuCount)).map { i in
+            let off = Int(CPU_STATE_MAX) * i
+            return (user: UInt32(info[off + Int(CPU_STATE_USER)]),
+                    sys: UInt32(info[off + Int(CPU_STATE_SYSTEM)]),
+                    idle: UInt32(info[off + Int(CPU_STATE_IDLE)]),
+                    nice: UInt32(info[off + Int(CPU_STATE_NICE)]))
+        }
+        return usages
+    }
 }
+
+// MARK: - Memory
 
 func getMemoryUsage() -> (used: Double, total: Double, pct: Double) {
     let total = Double(ProcessInfo.processInfo.physicalMemory) / (1024 * 1024 * 1024)
-
     var stats = vm_statistics64_data_t()
     var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
     let pageSize = Double(vm_kernel_page_size)
-
-    let result = withUnsafeMutablePointer(to: &stats) {
+    let r = withUnsafeMutablePointer(to: &stats) {
         $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
             host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
         }
     }
-    guard result == KERN_SUCCESS else { return (0, total, 0) }
-
-    let active     = Double(stats.active_count) * pageSize
-    let wired      = Double(stats.wire_count) * pageSize
-    let compressed = Double(stats.compressor_page_count) * pageSize
-    let used = (active + wired + compressed) / (1024 * 1024 * 1024)
-    let pct = total > 0 ? (used / total) * 100 : 0
-    return (used, total, pct)
+    guard r == KERN_SUCCESS else { return (0, total, 0) }
+    let used = (Double(stats.active_count) + Double(stats.wire_count) + Double(stats.compressor_page_count)) * pageSize / (1024 * 1024 * 1024)
+    return (used, total, total > 0 ? (used / total) * 100 : 0)
 }
 
+// MARK: - Disk & Uptime
+
 func getDiskUsage() -> (used: Double, total: Double) {
-    do {
-        let attrs = try FileManager.default.attributesOfFileSystem(forPath: "/")
-        let total = (attrs[.systemSize] as? NSNumber)?.doubleValue ?? 0
-        let free  = (attrs[.systemFreeSize] as? NSNumber)?.doubleValue ?? 0
-        return ((total - free) / (1024 * 1024 * 1024), total / (1024 * 1024 * 1024))
-    } catch { return (0, 0) }
+    guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/"),
+          let total = (attrs[.systemSize] as? NSNumber)?.doubleValue,
+          let free = (attrs[.systemFreeSize] as? NSNumber)?.doubleValue else { return (0, 0) }
+    return ((total - free) / (1024 * 1024 * 1024), total / (1024 * 1024 * 1024))
 }
 
 func getUptime() -> String {
@@ -162,62 +175,42 @@ func getUptime() -> String {
     return "\(m)m"
 }
 
-struct WiFiInfo {
-    let ssid: String
-    let rssi: Int // dBm
-    let bars: String
-}
+// MARK: - Wi-Fi (CoreWLAN → networkProfiles → IORegistry fallback)
 
-func getWiFiInfo() -> WiFiInfo? {
-    // Try CoreWLAN first
-    if let iface = CWWiFiClient.shared().interface(), let ssid = iface.ssid() {
-        let rssi = iface.rssiValue()
-        return WiFiInfo(ssid: ssid, rssi: rssi, bars: signalBars(rssi))
+func getWiFiInfo() -> (ssid: String, rssi: Int)? {
+    guard let iface = CWWiFiClient.shared().interface() else { return nil }
+    let rssi = iface.rssiValue()
+    if rssi == 0 { return nil } // not connected
+
+    // Try 1: direct SSID (works on macOS ≤ 13)
+    if let ssid = iface.ssid(), !ssid.isEmpty { return (ssid, rssi) }
+
+    // Try 2: saved network profiles (works macOS 14+ without entitlement)
+    if let profiles = iface.configuration()?.networkProfiles {
+        for case let p as CWNetworkProfile in profiles {
+            if let s = p.ssid, !s.isEmpty { return (s, rssi) }
+        }
     }
 
-    // Fallback: networksetup CLI (works without WiFi entitlement)
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
-    proc.arguments = ["-getairportnetwork", "en0"]
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = Pipe()
-    do {
-        try proc.run()
-        proc.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Output: "Current Wi-Fi Network: MyNetwork"
-        if let range = out.range(of: "Network: ") {
-            let ssid = String(out[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !ssid.isEmpty {
-                // Get RSSI via airport CLI
-                let rssi = getAirportRSSI()
-                return WiFiInfo(ssid: ssid, rssi: rssi, bars: signalBars(rssi))
-            }
-        }
-    } catch {}
-    return nil
+    // Try 3: IORegistry
+    if let ssid = ssidFromIORegistry() { return (ssid, rssi) }
+
+    return ("Wi-Fi", rssi) // connected but SSID hidden
 }
 
-func getAirportRSSI() -> Int {
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
-    proc.arguments = ["-I"]
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = Pipe()
-    do {
-        try proc.run()
-        proc.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        for line in out.components(separatedBy: "\n") {
-            if line.contains("agrCtlRSSI") {
-                let val = line.components(separatedBy: ":").last?.trimmingCharacters(in: .whitespaces) ?? ""
-                return Int(val) ?? -80
-            }
+func ssidFromIORegistry() -> String? {
+    let matchDict = IOServiceMatching("IO80211Interface") as CFDictionary
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, matchDict)
+    guard service != IO_OBJECT_NULL else { return nil }
+    defer { IOObjectRelease(service) }
+
+    for key in ["IO80211SSID_STR", "SSID_STR"] {
+        if let val = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue(),
+           let s = val as? String, !s.isEmpty, s != "<redacted>" {
+            return s
         }
-    } catch {}
-    return -80
+    }
+    return nil
 }
 
 func signalBars(_ rssi: Int) -> String {
@@ -229,10 +222,74 @@ func signalBars(_ rssi: Int) -> String {
     }
 }
 
-// MARK: - Render menu bar image
+// MARK: - Battery (IOKit AppleSmartBattery)
 
-// NOTE: Time rendering code preserved — to re-enable, add h/m/s/colonVisible params back
-// and uncomment the time drawing block below. Font: 14pt medium, colon blinks via NSColor.clear.
+struct BatteryInfo {
+    let level: Int          // 0-100
+    let charging: Bool
+    let cycleCount: Int
+    let health: Int         // 0-100 (maxCap / designCap)
+}
+
+func getBatteryInfo() -> BatteryInfo? {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+    guard service != IO_OBJECT_NULL else { return nil }
+    defer { IOObjectRelease(service) }
+
+    func val(_ key: String) -> Int? {
+        IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int
+    }
+    func flag(_ key: String) -> Bool {
+        (IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool) ?? false
+    }
+
+    guard let cur = val("CurrentCapacity"), let max = val("MaxCapacity") else { return nil }
+    let design = val("DesignCapacity") ?? max
+    let level = max > 0 ? (cur * 100) / max : 0
+    let health = design > 0 ? (max * 100) / design : 100
+
+    return BatteryInfo(
+        level: level,
+        charging: flag("IsCharging"),
+        cycleCount: val("CycleCount") ?? 0,
+        health: health
+    )
+}
+
+// MARK: - Claude Usage (Keychain + API)
+
+let keychainService = "team.skazka.netmonitor"
+
+func keychainSave(key: String, value: String) {
+    let data = value.data(using: .utf8)!
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                             kSecAttrService as String: keychainService,
+                             kSecAttrAccount as String: key,
+                             kSecValueData as String: data]
+    SecItemDelete(q as CFDictionary)
+    SecItemAdd(q as CFDictionary, nil)
+}
+
+func keychainLoad(key: String) -> String? {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                             kSecAttrService as String: keychainService,
+                             kSecAttrAccount as String: key,
+                             kSecReturnData as String: true,
+                             kSecMatchLimit as String: kSecMatchLimitOne]
+    var result: AnyObject?
+    guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+          let data = result as? Data else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+func keychainDelete(key: String) {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                             kSecAttrService as String: keychainService,
+                             kSecAttrAccount as String: key]
+    SecItemDelete(q as CFDictionary)
+}
+
+// MARK: - Render menu bar image
 
 func renderStatusImage(up: String, down: String, dateStr: String, height: CGFloat) -> NSImage {
     let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
@@ -263,26 +320,6 @@ func renderStatusImage(up: String, down: String, dateStr: String, height: CGFloa
     let dateY = (height - dateSize.height) / 2
     (dateStr as NSString).draw(at: NSPoint(x: dtX, y: dateY), withAttributes: dateAttrs)
 
-    /* TIME (disabled — re-enable when ready)
-    let timeFont  = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .medium)
-    let timeAttrs:  [NSAttributedString.Key: Any] = [.font: timeFont, .foregroundColor: NSColor.black]
-    let colonColor = colonVisible ? NSColor.black : NSColor.clear
-    let colonAttrs: [NSAttributedString.Key: Any] = [.font: timeFont, .foregroundColor: colonColor]
-    let digitSize = ("00" as NSString).size(withAttributes: timeAttrs)
-    let colonSize = (":" as NSString).size(withAttributes: timeAttrs)
-    let timeY = (height - digitSize.height) / 2
-    var tx = dtX + dateSize.width + 6
-    (String(format: "%02d", h) as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
-    tx += digitSize.width
-    (":" as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: colonAttrs)
-    tx += colonSize.width
-    (String(format: "%02d", m) as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
-    tx += digitSize.width
-    (":" as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: colonAttrs)
-    tx += colonSize.width
-    (String(format: "%02d", s) as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
-    */
-
     img.unlockFocus()
     img.isTemplate = true
     return img
@@ -295,11 +332,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var prevSnapshot: NetworkSnapshot?
     private var barHeight: CGFloat = 22
-    private var colonVisible = true
+    private let cpuMonitor = CPUMonitor()
 
     // Menu items
-    private var cpuTotalItem: NSMenuItem!
+    private var cpuItem: NSMenuItem!
     private var memItem: NSMenuItem!
+    private var battItem: NSMenuItem!
     private var wifiItem: NSMenuItem!
     private var flagMenuItem: NSMenuItem!
     private var ipMenuItem: NSMenuItem!
@@ -309,6 +347,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var uptimeItem: NSMenuItem!
     private var claude5hItem: NSMenuItem!
     private var claude7dItem: NSMenuItem!
+    private var claudeLoginItem: NSMenuItem!
     private var currentExtIP = ""
 
     private let dateFmt: DateFormatter = {
@@ -332,72 +371,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenu() {
         let menu = NSMenu()
+        menu.minimumWidth = 240
 
-        // Calendar — fill menu width
+        // Calendar
         let dp = NSDatePicker()
         dp.datePickerStyle = .clockAndCalendar
         dp.datePickerElements = .yearMonthDay
         dp.dateValue = Date()
         dp.isBezeled = false
         dp.drawsBackground = false
-        dp.translatesAutoresizingMaskIntoConstraints = false
-
-        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 210))
+        dp.sizeToFit()
+        let dpSize = dp.fittingSize
+        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: dpSize.width + 8, height: dpSize.height + 8))
+        dp.frame = NSRect(x: 4, y: 4, width: dpSize.width, height: dpSize.height)
         calBox.addSubview(dp)
-        NSLayoutConstraint.activate([
-            dp.topAnchor.constraint(equalTo: calBox.topAnchor, constant: 4),
-            dp.bottomAnchor.constraint(equalTo: calBox.bottomAnchor, constant: -4),
-            dp.leadingAnchor.constraint(equalTo: calBox.leadingAnchor, constant: 4),
-            dp.trailingAnchor.constraint(equalTo: calBox.trailingAnchor, constant: -4),
-        ])
-
         let calItem = NSMenuItem()
         calItem.view = calBox
         menu.addItem(calItem)
-
         menu.addItem(NSMenuItem.separator())
 
-        // CPU — total + one-line sparkline for cores
-        cpuTotalItem = NSMenuItem(title: "CPU:  ...", action: nil, keyEquivalent: "")
-        cpuTotalItem.isEnabled = false
-        menu.addItem(cpuTotalItem)
+        // System info — compact
+        cpuItem = NSMenuItem(title: "CPU:  ...", action: nil, keyEquivalent: "")
+        cpuItem.isEnabled = false
+        menu.addItem(cpuItem)
 
-        menu.addItem(NSMenuItem.separator())
-
-        // Memory
-        memItem = NSMenuItem(title: "Memory:  ...", action: nil, keyEquivalent: "")
+        memItem = NSMenuItem(title: "RAM:  ...", action: nil, keyEquivalent: "")
         memItem.isEnabled = false
         menu.addItem(memItem)
 
-        menu.addItem(NSMenuItem.separator())
+        battItem = NSMenuItem(title: "Battery:  ...", action: nil, keyEquivalent: "")
+        battItem.isEnabled = false
+        menu.addItem(battItem)
 
-        // Wi-Fi
         wifiItem = NSMenuItem(title: "Wi-Fi:  ...", action: nil, keyEquivalent: "")
         wifiItem.isEnabled = false
         menu.addItem(wifiItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        // Network IPs
-        flagMenuItem = NSMenuItem(title: "External IP: ...", action: #selector(copyExtIP), keyEquivalent: "")
-        flagMenuItem.target = self
-        menu.addItem(flagMenuItem)
-
-        ipMenuItem = NSMenuItem(title: "Local IP: ...", action: #selector(copyLocalIP), keyEquivalent: "")
-        ipMenuItem.target = self
-        menu.addItem(ipMenuItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        rxTotalItem = NSMenuItem(title: "Total In:  ...", action: nil, keyEquivalent: "")
-        rxTotalItem.isEnabled = false
-        menu.addItem(rxTotalItem)
-
-        txTotalItem = NSMenuItem(title: "Total Out: ...", action: nil, keyEquivalent: "")
-        txTotalItem.isEnabled = false
-        menu.addItem(txTotalItem)
-
-        menu.addItem(NSMenuItem.separator())
 
         diskItem = NSMenuItem(title: "Disk:  ...", action: nil, keyEquivalent: "")
         diskItem.isEnabled = false
@@ -409,18 +417,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Claude Usage
-        let claudeHeader = NSMenuItem(title: "Claude Code", action: nil, keyEquivalent: "")
-        claudeHeader.isEnabled = false
-        menu.addItem(claudeHeader)
+        // Network
+        flagMenuItem = NSMenuItem(title: "External IP: ...", action: #selector(copyExtIP), keyEquivalent: "")
+        flagMenuItem.target = self
+        menu.addItem(flagMenuItem)
 
-        claude5hItem = NSMenuItem(title: "  5h limit:  ...", action: nil, keyEquivalent: "")
+        ipMenuItem = NSMenuItem(title: "Local IP: ...", action: #selector(copyLocalIP), keyEquivalent: "")
+        ipMenuItem.target = self
+        menu.addItem(ipMenuItem)
+
+        rxTotalItem = NSMenuItem(title: "In: ...  Out: ...", action: nil, keyEquivalent: "")
+        rxTotalItem.isEnabled = false
+        menu.addItem(rxTotalItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Claude Usage
+        claude5hItem = NSMenuItem(title: "Claude 5h: ...", action: nil, keyEquivalent: "")
         claude5hItem.isEnabled = false
         menu.addItem(claude5hItem)
 
-        claude7dItem = NSMenuItem(title: "  7d limit:  ...", action: nil, keyEquivalent: "")
+        claude7dItem = NSMenuItem(title: "Claude 7d: ...", action: nil, keyEquivalent: "")
         claude7dItem.isEnabled = false
         menu.addItem(claude7dItem)
+
+        claudeLoginItem = NSMenuItem(title: "Claude: Set Session Key...", action: #selector(claudeLogin), keyEquivalent: "")
+        claudeLoginItem.target = self
+        menu.addItem(claudeLoginItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -433,7 +456,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(actItem)
 
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit NetMonitor", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         statusItem.menu = menu
     }
@@ -441,7 +464,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func startMonitoring() {
         let b = getNetworkBytes()
         prevSnapshot = NetworkSnapshot(rx: b.rx, tx: b.tx, timestamp: Date().timeIntervalSince1970)
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+        // Warm up CPU monitor (first call returns 0)
+        _ = cpuMonitor.totalUsage()
+        _ = cpuMonitor.perCoreUsage()
+
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer!, forMode: .common)
     }
 
@@ -457,160 +484,195 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if dt > 0 {
                 downStr = formatSpeed(Double(snap.rx - prev.rx) / dt)
                 upStr   = formatSpeed(Double(snap.tx - prev.tx) / dt)
-                rxTotalItem.title = "Total In:  \(formatBytes(snap.rx))"
-                txTotalItem.title = "Total Out: \(formatBytes(snap.tx))"
+                rxTotalItem.title = "In: \(formatBytes(snap.rx))  Out: \(formatBytes(snap.tx))"
             }
         }
 
-        // Date — capitalize day and month, remove trailing dot
-        var dateStr = dateFmt.string(from: now)
-            .replacingOccurrences(of: ".", with: "")
-        // Capitalize first letter (day) and month
+        // Date
+        var dateStr = dateFmt.string(from: now).replacingOccurrences(of: ".", with: "")
         let parts = dateStr.split(separator: " ", maxSplits: 2)
         if parts.count == 3 {
-            let day = parts[0].prefix(1).uppercased() + parts[0].dropFirst()
-            let num = parts[1]
-            let month = parts[2].prefix(1).uppercased() + parts[2].dropFirst()
-            dateStr = "\(day) \(num) \(month)"
-        } else if let c = dateStr.first {
-            dateStr = c.uppercased() + dateStr.dropFirst()
+            dateStr = "\(parts[0].prefix(1).uppercased())\(parts[0].dropFirst()) \(parts[1]) \(parts[2].prefix(1).uppercased())\(parts[2].dropFirst())"
         }
 
-        let img = renderStatusImage(up: upStr, down: downStr, dateStr: dateStr, height: barHeight)
-        statusItem.button?.image = img
+        statusItem.button?.image = renderStatusImage(up: upStr, down: downStr, dateStr: dateStr, height: barHeight)
 
-        // CPU — total + sparkline
-        let cpu = getCPUUsage()
-        let cores = getPerCoreCPU()
-        let bars = cores.usage.map { pct -> Character in
-            let blocks: [Character] = ["\u{2581}", "\u{2582}", "\u{2583}", "\u{2584}", "\u{2585}", "\u{2586}", "\u{2587}", "\u{2588}"]
-            let idx = min(Int(pct / 12.5), 7)
-            return blocks[idx]
-        }
-        cpuTotalItem.title = String(format: "CPU:  %3.0f%%  %@", cpu, String(bars))
+        // CPU — delta-based sparkline
+        let cpu = cpuMonitor.totalUsage()
+        let cores = cpuMonitor.perCoreUsage()
+        let blocks: [Character] = ["\u{2581}", "\u{2582}", "\u{2583}", "\u{2584}", "\u{2585}", "\u{2586}", "\u{2587}", "\u{2588}"]
+        let bars = cores.map { blocks[min(Int($0 / 12.5), 7)] }
+        cpuItem.title = String(format: "CPU  %3.0f%%  %@", cpu, String(bars))
 
         // Memory
         let mem = getMemoryUsage()
-        memItem.title = String(format: "Memory:   %.1f / %.0f GB  (%.0f%%)", mem.used, mem.total, mem.pct)
+        memItem.title = String(format: "RAM  %.1f / %.0f GB  (%.0f%%)", mem.used, mem.total, mem.pct)
+
+        // Battery
+        if let batt = getBatteryInfo() {
+            let chargeIcon = batt.charging ? "\u{26A1}" : ""
+            battItem.title = String(format: "Bat  %d%% %@ cyc:%d hlth:%d%%", batt.level, chargeIcon, batt.cycleCount, batt.health)
+            battItem.isHidden = false
+        } else {
+            battItem.isHidden = true // desktop Mac — no battery
+        }
 
         // Wi-Fi
         if let wifi = getWiFiInfo() {
-            wifiItem.title = "Wi-Fi:   \(wifi.ssid)  \(wifi.bars)  \(wifi.rssi) dBm"
+            wifiItem.title = "Wi-Fi  \(wifi.ssid)  \(signalBars(wifi.rssi))  \(wifi.rssi)dBm"
         } else {
-            wifiItem.title = "Wi-Fi:   Not connected"
+            wifiItem.title = "Wi-Fi  Not connected"
         }
 
         // Disk & Uptime
         let disk = getDiskUsage()
-        diskItem.title = String(format: "Disk:    %.0f / %.0f GB", disk.used, disk.total)
-        uptimeItem.title = "Uptime:  \(getUptime())"
+        diskItem.title = String(format: "Disk  %.0f / %.0f GB", disk.used, disk.total)
+        uptimeItem.title = "Up  \(getUptime())"
 
         ipMenuItem.title = "Local IP: \(getLocalIP())"
         prevSnapshot = snap
     }
 
-    private func getClaudeToken() -> String? {
-        // Try Security framework first
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: AnyObject?
-        var status = SecItemCopyMatching(query as CFDictionary, &result)
+    // MARK: - Claude Usage
 
-        // Fallback: try via security CLI (works when Keychain ACL blocks direct access)
-        if status != errSecSuccess {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-            proc.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = Pipe()
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if proc.terminationStatus == 0,
-                   let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   let jsonData = str.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                   let oauth = json["claudeAiOauth"] as? [String: Any],
-                   let token = oauth["accessToken"] as? String {
-                    return token
-                }
-            } catch {}
-            return nil
+    @objc private func claudeLogin() {
+        let alert = NSAlert()
+        alert.messageText = "Claude Session Key"
+        alert.informativeText = "1. Open claude.ai in Safari\n2. F12 → Application → Cookies → claude.ai\n3. Copy 'sessionKey' value (sk-ant-sid...)\n\nAlso enter your Organization ID from the URL:\nclaude.ai/settings → look at URL for org ID"
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Logout")
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 340, height: 52))
+        stack.orientation = .vertical
+        stack.spacing = 4
+
+        let keyField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        keyField.placeholderString = "sk-ant-sid01-..."
+        keyField.stringValue = keychainLoad(key: "sessionKey") ?? ""
+
+        let orgField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        orgField.placeholderString = "org ID (from URL)"
+        orgField.stringValue = keychainLoad(key: "orgId") ?? ""
+
+        stack.addArrangedSubview(keyField)
+        stack.addArrangedSubview(orgField)
+        alert.accessoryView = stack
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
+            let org = orgField.stringValue.trimmingCharacters(in: .whitespaces)
+            if !key.isEmpty && !org.isEmpty {
+                keychainSave(key: "sessionKey", value: key)
+                keychainSave(key: "orgId", value: org)
+                fetchClaudeUsage()
+            }
+        } else if response == .alertThirdButtonReturn {
+            keychainDelete(key: "sessionKey")
+            keychainDelete(key: "orgId")
+            claude5hItem.title = "Claude 5h: —"
+            claude7dItem.title = "Claude 7d: —"
         }
-
-        guard let data = result as? Data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String
-        else { return nil }
-        return token
     }
 
     private func fetchClaudeUsage() {
-        guard let token = getClaudeToken(),
-              let url = URL(string: "https://api.anthropic.com/api/oauth/usage")
+        // Try 1: Claude Code OAuth from system Keychain
+        if let token = getClaudeCodeToken() {
+            fetchUsageWithOAuth(token: token)
+            return
+        }
+
+        // Try 2: Manual sessionKey
+        guard let sessionKey = keychainLoad(key: "sessionKey"),
+              let orgId = keychainLoad(key: "orgId"),
+              let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/usage")
         else {
             DispatchQueue.main.async {
-                self.claude5hItem.title = "  5h limit:  No Claude Code auth"
-                self.claude7dItem.title = "  7d limit:  —"
+                self.claude5hItem.title = "Claude 5h: —"
+                self.claude7dItem.title = "Claude 7d: —"
             }
             return
         }
 
+        var req = URLRequest(url: url)
+        req.setValue("sessionKey=\(sessionKey)", forHTTPHeaderField: "Cookie")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            if let http = resp as? HTTPURLResponse, http.statusCode == 403 || http.statusCode == 401 {
+                DispatchQueue.main.async { self?.claude5hItem.title = "Claude 5h: Session expired" }
+                return
+            }
+            self?.parseUsageResponse(data)
+        }.resume()
+    }
+
+    private func getClaudeCodeToken() -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let jsonData = str.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let oauth = json["claudeAiOauth"] as? [String: Any],
+                  let token = oauth["accessToken"] as? String
+            else { return nil }
+            return token
+        } catch { return nil }
+    }
+
+    private func fetchUsageWithOAuth(token: String) {
+        guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else { return }
         var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let data = data,
-                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return }
-
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-            fmt.timeZone = TimeZone.current
-
-            DispatchQueue.main.async {
-                if let fiveH = j["five_hour"] as? [String: Any],
-                   let util5 = fiveH["utilization"] as? Double {
-                    var reset5 = ""
-                    if let r = fiveH["resets_at"] as? String {
-                        let isoFmt = DateFormatter()
-                        isoFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZZZZZ"
-                        if let d = isoFmt.date(from: r) {
-                            let rf = DateFormatter()
-                            rf.dateFormat = "HH:mm"
-                            reset5 = "  (reset \(rf.string(from: d)))"
-                        }
-                    }
-                    self?.claude5hItem.title = String(format: "  5h limit:  %.0f%%%@", util5, reset5)
-                }
-
-                if let sevenD = j["seven_day"] as? [String: Any],
-                   let util7 = sevenD["utilization"] as? Double {
-                    var reset7 = ""
-                    if let r = sevenD["resets_at"] as? String {
-                        let isoFmt = DateFormatter()
-                        isoFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZZZZZ"
-                        if let d = isoFmt.date(from: r) {
-                            let rf = DateFormatter()
-                            rf.locale = Locale(identifier: "ru_RU")
-                            rf.dateFormat = "d MMM HH:mm"
-                            reset7 = "  (reset \(rf.string(from: d)))"
-                        }
-                    }
-                    self?.claude7dItem.title = String(format: "  7d limit:  %.0f%%%@", util7, reset7)
-                }
-            }
+            self?.parseUsageResponse(data)
         }.resume()
     }
+
+    private func parseUsageResponse(_ data: Data?) {
+        guard let data = data,
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            if let fiveH = j["five_hour"] as? [String: Any],
+               let u5 = fiveH["utilization"] as? Double {
+                let reset = self?.parseResetTime(fiveH["resets_at"] as? String, short: true) ?? ""
+                self?.claude5hItem.title = String(format: "Claude 5h: %.0f%%%@", u5, reset)
+            }
+            if let sevenD = j["seven_day"] as? [String: Any],
+               let u7 = sevenD["utilization"] as? Double {
+                let reset = self?.parseResetTime(sevenD["resets_at"] as? String, short: false) ?? ""
+                self?.claude7dItem.title = String(format: "Claude 7d: %.0f%%%@", u7, reset)
+            }
+        }
+    }
+
+    private func parseResetTime(_ str: String?, short: Bool) -> String {
+        guard let str = str else { return "" }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZZZZZ"
+        guard let d = fmt.date(from: str) else { return "" }
+        let rf = DateFormatter()
+        rf.locale = Locale(identifier: "ru_RU")
+        rf.dateFormat = short ? "HH:mm" : "d MMM HH:mm"
+        return "  \u{21BB}\(rf.string(from: d))"
+    }
+
+    // MARK: - GeoIP
 
     private func fetchGeoIP() {
         guard let url = URL(string: "https://ipapi.co/json/") else { return }
@@ -624,18 +686,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             else { return }
             DispatchQueue.main.async {
                 self?.currentExtIP = ip
-                self?.flagMenuItem.title = "\(countryFlag(code))  External IP: \(ip)"
+                self?.flagMenuItem.title = "\(countryFlag(code)) External IP: \(ip)"
             }
         }.resume()
     }
 
-    @objc private func openTerminal() {
-        NSWorkspace.shared.launchApplication("Terminal")
-    }
+    // MARK: - Actions
 
-    @objc private func openActivityMonitor() {
-        NSWorkspace.shared.launchApplication("Activity Monitor")
-    }
+    @objc private func openTerminal() { NSWorkspace.shared.launchApplication("Terminal") }
+    @objc private func openActivityMonitor() { NSWorkspace.shared.launchApplication("Activity Monitor") }
 
     @objc private func copyLocalIP() {
         NSPasteboard.general.clearContents()

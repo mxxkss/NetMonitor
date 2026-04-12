@@ -461,7 +461,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         openaiBalanceItem.isEnabled = false
         menu.addItem(openaiBalanceItem)
 
-        openaiLoginItem = NSMenuItem(title: "OpenAI: Set API Key...", action: #selector(openaiLogin), keyEquivalent: "")
+        openaiLoginItem = NSMenuItem(title: "OpenAI: Set Session Token...", action: #selector(openaiLogin), keyEquivalent: "")
         openaiLoginItem.target = self
         menu.addItem(openaiLoginItem)
 
@@ -700,60 +700,120 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "  \u{21BB}\(rf.string(from: d))"
     }
 
-    // MARK: - OpenAI Balance
+    // MARK: - OpenAI Balance (via session token from Safari)
 
     @objc private func openaiLogin() {
         let alert = NSAlert()
-        alert.messageText = "OpenAI API Key"
-        alert.informativeText = "platform.openai.com → API Keys → Create new key"
+        alert.messageText = "OpenAI Session Token"
+        alert.informativeText = "1. Open platform.openai.com in Safari, log in\n2. Safari → Develop → Show Web Inspector\n3. Tab \"Storage\" → Cookies → platform.openai.com\n4. Copy \"__Secure-next-auth.session-token\" value"
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Remove")
 
         let keyField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        keyField.placeholderString = "sk-..."
-        keyField.stringValue = keychainLoad(key: "openai-key") ?? ""
+        keyField.placeholderString = "eyJ..."
+        keyField.stringValue = keychainLoad(key: "openai-session") ?? ""
         alert.accessoryView = keyField
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
             let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
             if !key.isEmpty {
-                keychainSave(key: "openai-key", value: key)
+                keychainSave(key: "openai-session", value: key)
                 fetchOpenAIBalance()
             }
         } else if response == .alertThirdButtonReturn {
-            keychainDelete(key: "openai-key")
+            keychainDelete(key: "openai-session")
             openaiBalanceItem.title = "OpenAI: —"
         }
     }
 
     private func fetchOpenAIBalance() {
-        guard let apiKey = keychainLoad(key: "openai-key") else {
+        guard let session = keychainLoad(key: "openai-session") else {
             DispatchQueue.main.async { self.openaiBalanceItem.title = "OpenAI: —" }
             return
         }
 
-        // Validate key via /v1/models (billing API was removed by OpenAI)
-        guard let url = URL(string: "https://api.openai.com/v1/models") else { return }
+        // First get access token via /api/auth/session
+        guard let url = URL(string: "https://platform.openai.com/api/auth/session") else { return }
         var req = URLRequest(url: url)
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("__Secure-next-auth.session-token=\(session)", forHTTPHeaderField: "Cookie")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
-            guard let http = resp as? HTTPURLResponse else {
-                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: error" }
+            // Try to extract accessToken from session response
+            if let data = data,
+               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let token = j["accessToken"] as? String {
+                self?.fetchOpenAICreditGrants(accessToken: token)
+                return
+            }
+
+            // If no accessToken, try using session cookie directly on billing
+            self?.fetchOpenAICreditGrants(sessionCookie: session)
+        }.resume()
+    }
+
+    private func fetchOpenAICreditGrants(accessToken: String? = nil, sessionCookie: String? = nil) {
+        guard let url = URL(string: "https://api.openai.com/dashboard/billing/credit_grants") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
+
+        if let token = accessToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        } else if let cookie = sessionCookie {
+            req.setValue("__Secure-next-auth.session-token=\(cookie)", forHTTPHeaderField: "Cookie")
+        }
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            if let http = resp as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
+                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: session expired" }
+                return
+            }
+
+            guard let data = data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let total = j["total_available"] as? Double
+            else {
+                // Fallback: try subscription endpoint
+                if let token = accessToken {
+                    self?.fetchOpenAISubscription(accessToken: token)
+                } else {
+                    DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: no data" }
+                }
                 return
             }
 
             DispatchQueue.main.async {
-                if http.statusCode == 200 {
-                    self?.openaiBalanceItem.title = "OpenAI: \u{2713} Active"
-                } else if http.statusCode == 401 {
-                    self?.openaiBalanceItem.title = "OpenAI: bad key"
-                } else if http.statusCode == 429 {
-                    self?.openaiBalanceItem.title = "OpenAI: rate limited"
+                self?.openaiBalanceItem.title = String(format: "OpenAI: $%.2f", total)
+            }
+        }.resume()
+    }
+
+    private func fetchOpenAISubscription(accessToken: String) {
+        guard let url = URL(string: "https://api.openai.com/dashboard/billing/subscription") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data = data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: no data" }
+                return
+            }
+
+            let limit = j["hard_limit_usd"] as? Double
+            let plan = (j["plan"] as? [String: Any])?["title"] as? String
+
+            DispatchQueue.main.async {
+                if let limit = limit, limit > 0 {
+                    self?.openaiBalanceItem.title = String(format: "OpenAI: limit $%.0f", limit)
+                } else if let plan = plan {
+                    self?.openaiBalanceItem.title = "OpenAI: \(plan)"
                 } else {
-                    self?.openaiBalanceItem.title = "OpenAI: error \(http.statusCode)"
+                    self?.openaiBalanceItem.title = "OpenAI: \u{2713} connected"
                 }
             }
         }.resume()

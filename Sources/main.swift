@@ -169,17 +169,64 @@ struct WiFiInfo {
 }
 
 func getWiFiInfo() -> WiFiInfo? {
-    guard let iface = CWWiFiClient.shared().interface(),
-          let ssid = iface.ssid() else { return nil }
-    let rssi = iface.rssiValue()
-    let bars: String
-    switch rssi {
-    case -50...0:    bars = "\u{2587}\u{2587}\u{2587}\u{2587}"
-    case -60...(-51): bars = "\u{2587}\u{2587}\u{2587}\u{2581}"
-    case -70...(-61): bars = "\u{2587}\u{2587}\u{2581}\u{2581}"
-    default:          bars = "\u{2587}\u{2581}\u{2581}\u{2581}"
+    // Try CoreWLAN first
+    if let iface = CWWiFiClient.shared().interface(), let ssid = iface.ssid() {
+        let rssi = iface.rssiValue()
+        return WiFiInfo(ssid: ssid, rssi: rssi, bars: signalBars(rssi))
     }
-    return WiFiInfo(ssid: ssid, rssi: rssi, bars: bars)
+
+    // Fallback: networksetup CLI (works without WiFi entitlement)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+    proc.arguments = ["-getairportnetwork", "en0"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = Pipe()
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Output: "Current Wi-Fi Network: MyNetwork"
+        if let range = out.range(of: "Network: ") {
+            let ssid = String(out[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ssid.isEmpty {
+                // Get RSSI via airport CLI
+                let rssi = getAirportRSSI()
+                return WiFiInfo(ssid: ssid, rssi: rssi, bars: signalBars(rssi))
+            }
+        }
+    } catch {}
+    return nil
+}
+
+func getAirportRSSI() -> Int {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
+    proc.arguments = ["-I"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = Pipe()
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        for line in out.components(separatedBy: "\n") {
+            if line.contains("agrCtlRSSI") {
+                let val = line.components(separatedBy: ":").last?.trimmingCharacters(in: .whitespaces) ?? ""
+                return Int(val) ?? -80
+            }
+        }
+    } catch {}
+    return -80
+}
+
+func signalBars(_ rssi: Int) -> String {
+    switch rssi {
+    case -50...0:     return "\u{2587}\u{2587}\u{2587}\u{2587}"
+    case -60...(-51): return "\u{2587}\u{2587}\u{2587}\u{2581}"
+    case -70...(-61): return "\u{2587}\u{2587}\u{2581}\u{2581}"
+    default:          return "\u{2587}\u{2581}\u{2581}\u{2581}"
+    }
 }
 
 // MARK: - Render menu bar image

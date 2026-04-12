@@ -20,6 +20,8 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocationUsageDescription</key>
+    <string>NetMonitor needs location access to read Wi-Fi network name.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>

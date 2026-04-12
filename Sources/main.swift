@@ -348,6 +348,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var claude5hItem: NSMenuItem!
     private var claude7dItem: NSMenuItem!
     private var claudeLoginItem: NSMenuItem!
+    private var openaiBalanceItem: NSMenuItem!
+    private var openaiLoginItem: NSMenuItem!
     private var currentExtIP = ""
 
     private let dateFmt: DateFormatter = {
@@ -365,7 +367,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startMonitoring()
         fetchGeoIP()
         fetchClaudeUsage()
-        Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.fetchGeoIP() }
+        fetchOpenAIBalance()
+        Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
+            self?.fetchGeoIP()
+            self?.fetchOpenAIBalance()
+        }
         Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in self?.fetchClaudeUsage() }
     }
 
@@ -380,10 +386,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dp.dateValue = Date()
         dp.isBezeled = false
         dp.drawsBackground = false
-        dp.sizeToFit()
-        let dpSize = dp.fittingSize
-        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: dpSize.width + 8, height: dpSize.height + 8))
-        dp.frame = NSRect(x: 4, y: 4, width: dpSize.width, height: dpSize.height)
+        dp.frame = NSRect(x: 4, y: 4, width: 280, height: 200)
+        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 288, height: 208))
         calBox.addSubview(dp)
         let calItem = NSMenuItem()
         calItem.view = calBox
@@ -444,6 +448,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         claudeLoginItem = NSMenuItem(title: "Claude: Set Session Key...", action: #selector(claudeLogin), keyEquivalent: "")
         claudeLoginItem.target = self
         menu.addItem(claudeLoginItem)
+
+        // OpenAI
+        openaiBalanceItem = NSMenuItem(title: "OpenAI: —", action: nil, keyEquivalent: "")
+        openaiBalanceItem.isEnabled = false
+        menu.addItem(openaiBalanceItem)
+
+        openaiLoginItem = NSMenuItem(title: "OpenAI: Set API Key...", action: #selector(openaiLogin), keyEquivalent: "")
+        openaiLoginItem.target = self
+        menu.addItem(openaiLoginItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -678,6 +691,93 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rf.locale = Locale(identifier: "ru_RU")
         rf.dateFormat = short ? "HH:mm" : "d MMM HH:mm"
         return "  \u{21BB}\(rf.string(from: d))"
+    }
+
+    // MARK: - OpenAI Balance
+
+    @objc private func openaiLogin() {
+        let alert = NSAlert()
+        alert.messageText = "OpenAI API Key"
+        alert.informativeText = "platform.openai.com → API Keys → Create new key"
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Remove")
+
+        let keyField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        keyField.placeholderString = "sk-..."
+        keyField.stringValue = keychainLoad(key: "openai-key") ?? ""
+        alert.accessoryView = keyField
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
+            if !key.isEmpty {
+                keychainSave(key: "openai-key", value: key)
+                fetchOpenAIBalance()
+            }
+        } else if response == .alertThirdButtonReturn {
+            keychainDelete(key: "openai-key")
+            openaiBalanceItem.title = "OpenAI: —"
+        }
+    }
+
+    private func fetchOpenAIBalance() {
+        guard let apiKey = keychainLoad(key: "openai-key") else {
+            DispatchQueue.main.async { self.openaiBalanceItem.title = "OpenAI: —" }
+            return
+        }
+
+        // Try credit grants endpoint (prepaid credits)
+        guard let url = URL(string: "https://api.openai.com/dashboard/billing/credit_grants") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            // If credit_grants fails, try subscription endpoint
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                self?.fetchOpenAISubscription(apiKey: apiKey)
+                return
+            }
+
+            guard let data = data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let total = j["total_available"] as? Double
+            else {
+                self?.fetchOpenAISubscription(apiKey: apiKey)
+                return
+            }
+
+            DispatchQueue.main.async {
+                self?.openaiBalanceItem.title = String(format: "OpenAI: $%.2f", total)
+            }
+        }.resume()
+    }
+
+    private func fetchOpenAISubscription(apiKey: String) {
+        guard let url = URL(string: "https://api.openai.com/dashboard/billing/subscription") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data = data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: key error" }
+                return
+            }
+
+            let limit = j["hard_limit_usd"] as? Double ?? 0
+            let plan = j["plan"] as? [String: Any]
+            let planName = plan?["title"] as? String ?? "API"
+
+            DispatchQueue.main.async {
+                if limit > 0 {
+                    self?.openaiBalanceItem.title = String(format: "OpenAI: %@ (limit $%.0f)", planName, limit)
+                } else {
+                    self?.openaiBalanceItem.title = "OpenAI: \(planName)"
+                }
+            }
+        }.resume()
     }
 
     // MARK: - GeoIP

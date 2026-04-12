@@ -295,8 +295,15 @@ func renderStatusImage(up: String, down: String, dateStr: String, height: CGFloa
     let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
     let dateFont  = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
 
-    let speedAttrs: [NSAttributedString.Key: Any] = [.font: speedFont, .foregroundColor: NSColor.black]
-    let dateAttrs:  [NSAttributedString.Key: Any] = [.font: dateFont,  .foregroundColor: NSColor.black]
+    let textColor: NSColor = {
+        if let appearance = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]),
+           appearance == .darkAqua {
+            return .white
+        }
+        return .black
+    }()
+    let speedAttrs: [NSAttributedString.Key: Any] = [.font: speedFont, .foregroundColor: textColor]
+    let dateAttrs:  [NSAttributedString.Key: Any] = [.font: dateFont,  .foregroundColor: textColor]
 
     let upStr   = "\u{2191}\(up)"
     let downStr = "\u{2193}\(down)"
@@ -321,7 +328,7 @@ func renderStatusImage(up: String, down: String, dateStr: String, height: CGFloa
     (dateStr as NSString).draw(at: NSPoint(x: dtX, y: dateY), withAttributes: dateAttrs)
 
     img.unlockFocus()
-    img.isTemplate = true
+    img.isTemplate = false
     return img
 }
 
@@ -386,8 +393,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dp.dateValue = Date()
         dp.isBezeled = false
         dp.drawsBackground = false
-        dp.frame = NSRect(x: 4, y: 4, width: 280, height: 200)
-        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 288, height: 208))
+        dp.frame = NSRect(x: 4, y: 4, width: 310, height: 260)
+        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 318, height: 268))
         calBox.addSubview(dp)
         let calItem = NSMenuItem()
         calItem.view = calBox
@@ -727,54 +734,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Try credit grants endpoint (prepaid credits)
-        guard let url = URL(string: "https://api.openai.com/dashboard/billing/credit_grants") else { return }
+        // Validate key via /v1/models (billing API was removed by OpenAI)
+        guard let url = URL(string: "https://api.openai.com/v1/models") else { return }
         var req = URLRequest(url: url)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
-            // If credit_grants fails, try subscription endpoint
-            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
-                self?.fetchOpenAISubscription(apiKey: apiKey)
-                return
-            }
-
-            guard let data = data,
-                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let total = j["total_available"] as? Double
-            else {
-                self?.fetchOpenAISubscription(apiKey: apiKey)
+            guard let http = resp as? HTTPURLResponse else {
+                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: error" }
                 return
             }
 
             DispatchQueue.main.async {
-                self?.openaiBalanceItem.title = String(format: "OpenAI: $%.2f", total)
-            }
-        }.resume()
-    }
-
-    private func fetchOpenAISubscription(apiKey: String) {
-        guard let url = URL(string: "https://api.openai.com/dashboard/billing/subscription") else { return }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let data = data,
-                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else {
-                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: key error" }
-                return
-            }
-
-            let limit = j["hard_limit_usd"] as? Double ?? 0
-            let plan = j["plan"] as? [String: Any]
-            let planName = plan?["title"] as? String ?? "API"
-
-            DispatchQueue.main.async {
-                if limit > 0 {
-                    self?.openaiBalanceItem.title = String(format: "OpenAI: %@ (limit $%.0f)", planName, limit)
+                if http.statusCode == 200 {
+                    self?.openaiBalanceItem.title = "OpenAI: \u{2713} Active"
+                } else if http.statusCode == 401 {
+                    self?.openaiBalanceItem.title = "OpenAI: bad key"
+                } else if http.statusCode == 429 {
+                    self?.openaiBalanceItem.title = "OpenAI: rate limited"
                 } else {
-                    self?.openaiBalanceItem.title = "OpenAI: \(planName)"
+                    self?.openaiBalanceItem.title = "OpenAI: error \(http.statusCode)"
                 }
             }
         }.resume()

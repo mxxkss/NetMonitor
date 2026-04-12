@@ -194,16 +194,16 @@ func renderStatusImage(up: String, down: String, dateStr: String, height: CGFloa
     let speedAttrs: [NSAttributedString.Key: Any] = [.font: speedFont, .foregroundColor: NSColor.black]
     let dateAttrs:  [NSAttributedString.Key: Any] = [.font: dateFont,  .foregroundColor: NSColor.black]
 
-    let upStr   = "\u{2191} \(up)"
-    let downStr = "\u{2193} \(down)"
+    let upStr   = "\u{2191}\(up)"
+    let downStr = "\u{2193}\(down)"
 
     let upSize   = (upStr as NSString).size(withAttributes: speedAttrs)
     let downSize = (downStr as NSString).size(withAttributes: speedAttrs)
     let dateSize = (dateStr as NSString).size(withAttributes: dateAttrs)
 
     let speedW = max(upSize.width, downSize.width)
-    let gap: CGFloat = 8
-    let totalW = ceil(speedW + gap + dateSize.width)
+    let gap: CGFloat = 5
+    let totalW = ceil(speedW + gap + dateSize.width + 1)
 
     let img = NSImage(size: NSSize(width: totalW, height: height))
     img.lockFocus()
@@ -252,7 +252,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Menu items
     private var cpuTotalItem: NSMenuItem!
-    private var cpuCoreItems: [NSMenuItem] = []
     private var memItem: NSMenuItem!
     private var wifiItem: NSMenuItem!
     private var flagMenuItem: NSMenuItem!
@@ -287,35 +286,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildMenu() {
         let menu = NSMenu()
 
-        // Calendar
+        // Calendar — fill menu width
         let dp = NSDatePicker()
         dp.datePickerStyle = .clockAndCalendar
         dp.datePickerElements = .yearMonthDay
         dp.dateValue = Date()
         dp.isBezeled = false
         dp.drawsBackground = false
-        dp.frame = NSRect(x: 8, y: 4, width: 280, height: 200)
-        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 296, height: 208))
+        dp.translatesAutoresizingMaskIntoConstraints = false
+
+        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 210))
         calBox.addSubview(dp)
+        NSLayoutConstraint.activate([
+            dp.topAnchor.constraint(equalTo: calBox.topAnchor, constant: 4),
+            dp.bottomAnchor.constraint(equalTo: calBox.bottomAnchor, constant: -4),
+            dp.leadingAnchor.constraint(equalTo: calBox.leadingAnchor, constant: 4),
+            dp.trailingAnchor.constraint(equalTo: calBox.trailingAnchor, constant: -4),
+        ])
+
         let calItem = NSMenuItem()
         calItem.view = calBox
         menu.addItem(calItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // CPU
+        // CPU — total + one-line sparkline for cores
         cpuTotalItem = NSMenuItem(title: "CPU:  ...", action: nil, keyEquivalent: "")
         cpuTotalItem.isEnabled = false
         menu.addItem(cpuTotalItem)
-
-        let numCores = ProcessInfo.processInfo.processorCount
-        for i in 0..<numCores {
-            let prefix = i == numCores - 1 ? "\u{2514}" : "\u{251C}"
-            let item = NSMenuItem(title: "  \(prefix) Core \(i + 1):  ...", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            cpuCoreItems.append(item)
-            menu.addItem(item)
-        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -417,24 +415,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Date
+        // Date — capitalize day and month, remove trailing dot
         var dateStr = dateFmt.string(from: now)
-        if let c = dateStr.first { dateStr = c.uppercased() + dateStr.dropFirst() }
+            .replacingOccurrences(of: ".", with: "")
+        // Capitalize first letter (day) and month
+        let parts = dateStr.split(separator: " ", maxSplits: 2)
+        if parts.count == 3 {
+            let day = parts[0].prefix(1).uppercased() + parts[0].dropFirst()
+            let num = parts[1]
+            let month = parts[2].prefix(1).uppercased() + parts[2].dropFirst()
+            dateStr = "\(day) \(num) \(month)"
+        } else if let c = dateStr.first {
+            dateStr = c.uppercased() + dateStr.dropFirst()
+        }
 
         let img = renderStatusImage(up: upStr, down: downStr, dateStr: dateStr, height: barHeight)
         statusItem.button?.image = img
 
-        // CPU
+        // CPU — total + sparkline
         let cpu = getCPUUsage()
-        cpuTotalItem.title = String(format: "CPU Total:    %4.0f%%", cpu)
-
         let cores = getPerCoreCPU()
-        for (i, item) in cpuCoreItems.enumerated() {
-            let prefix = i == cpuCoreItems.count - 1 ? "\u{2514}" : "\u{251C}"
-            if i < cores.usage.count {
-                item.title = String(format: "  %@ Core %d:   %4.0f%%", prefix, i + 1, cores.usage[i])
-            }
+        let bars = cores.usage.map { pct -> Character in
+            let blocks: [Character] = ["\u{2581}", "\u{2582}", "\u{2583}", "\u{2584}", "\u{2585}", "\u{2586}", "\u{2587}", "\u{2588}"]
+            let idx = min(Int(pct / 12.5), 7)
+            return blocks[idx]
         }
+        cpuTotalItem.title = String(format: "CPU:  %3.0f%%  %@", cpu, String(bars))
 
         // Memory
         let mem = getMemoryUsage()
@@ -457,6 +463,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func getClaudeToken() -> String? {
+        // Try Security framework first
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -464,8 +471,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data,
+        var status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        // Fallback: try via security CLI (works when Keychain ACL blocks direct access)
+        if status != errSecSuccess {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+            proc.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if proc.terminationStatus == 0,
+                   let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   let jsonData = str.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                   let oauth = json["claudeAiOauth"] as? [String: Any],
+                   let token = oauth["accessToken"] as? String {
+                    return token
+                }
+            } catch {}
+            return nil
+        }
+
+        guard let data = result as? Data,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = json["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String

@@ -184,61 +184,57 @@ func getWiFiInfo() -> WiFiInfo? {
 
 // MARK: - Render menu bar image
 
-func renderStatusImage(up: String, down: String, dateStr: String,
-                       h: Int, m: Int, s: Int, colonVisible: Bool, height: CGFloat) -> NSImage {
+// NOTE: Time rendering code preserved — to re-enable, add h/m/s/colonVisible params back
+// and uncomment the time drawing block below. Font: 14pt medium, colon blinks via NSColor.clear.
+
+func renderStatusImage(up: String, down: String, dateStr: String, height: CGFloat) -> NSImage {
     let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
     let dateFont  = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-    let timeFont  = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .medium)
 
     let speedAttrs: [NSAttributedString.Key: Any] = [.font: speedFont, .foregroundColor: NSColor.black]
     let dateAttrs:  [NSAttributedString.Key: Any] = [.font: dateFont,  .foregroundColor: NSColor.black]
-    let timeAttrs:  [NSAttributedString.Key: Any] = [.font: timeFont,  .foregroundColor: NSColor.black]
-    let colonColor = colonVisible ? NSColor.black : NSColor.clear
-    let colonAttrs: [NSAttributedString.Key: Any] = [.font: timeFont,  .foregroundColor: colonColor]
 
     let upStr   = "\u{2191} \(up)"
     let downStr = "\u{2193} \(down)"
 
-    let upSize    = (upStr as NSString).size(withAttributes: speedAttrs)
-    let downSize  = (downStr as NSString).size(withAttributes: speedAttrs)
-    let dateSize  = (dateStr as NSString).size(withAttributes: dateAttrs)
-    let digitSize = ("00" as NSString).size(withAttributes: timeAttrs)
-    let colonSize = (":" as NSString).size(withAttributes: timeAttrs)
+    let upSize   = (upStr as NSString).size(withAttributes: speedAttrs)
+    let downSize = (downStr as NSString).size(withAttributes: speedAttrs)
+    let dateSize = (dateStr as NSString).size(withAttributes: dateAttrs)
 
     let speedW = max(upSize.width, downSize.width)
     let gap: CGFloat = 8
-    let timeW = digitSize.width * 3 + colonSize.width * 2
-    let totalW = ceil(speedW + gap + dateSize.width + 6 + timeW)
+    let totalW = ceil(speedW + gap + dateSize.width)
 
     let img = NSImage(size: NSSize(width: totalW, height: height))
     img.lockFocus()
 
-    // Speed: upload top, download bottom
     let lineH = height / 2
     (upStr as NSString).draw(at: NSPoint(x: 0, y: lineH + 1), withAttributes: speedAttrs)
     (downStr as NSString).draw(at: NSPoint(x: 0, y: 1), withAttributes: speedAttrs)
 
-    // Date
     let dtX = speedW + gap
     let dateY = (height - dateSize.height) / 2
     (dateStr as NSString).draw(at: NSPoint(x: dtX, y: dateY), withAttributes: dateAttrs)
 
-    // Time: draw HH : MM : SS at fixed positions (colon blinks via color)
+    /* TIME (disabled — re-enable when ready)
+    let timeFont  = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .medium)
+    let timeAttrs:  [NSAttributedString.Key: Any] = [.font: timeFont, .foregroundColor: NSColor.black]
+    let colonColor = colonVisible ? NSColor.black : NSColor.clear
+    let colonAttrs: [NSAttributedString.Key: Any] = [.font: timeFont, .foregroundColor: colonColor]
+    let digitSize = ("00" as NSString).size(withAttributes: timeAttrs)
+    let colonSize = (":" as NSString).size(withAttributes: timeAttrs)
     let timeY = (height - digitSize.height) / 2
     var tx = dtX + dateSize.width + 6
-    let hh = String(format: "%02d", h)
-    let mm = String(format: "%02d", m)
-    let ss = String(format: "%02d", s)
-
-    (hh as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
+    (String(format: "%02d", h) as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
     tx += digitSize.width
     (":" as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: colonAttrs)
     tx += colonSize.width
-    (mm as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
+    (String(format: "%02d", m) as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
     tx += digitSize.width
     (":" as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: colonAttrs)
     tx += colonSize.width
-    (ss as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
+    (String(format: "%02d", s) as NSString).draw(at: NSPoint(x: tx, y: timeY), withAttributes: timeAttrs)
+    */
 
     img.unlockFocus()
     img.isTemplate = true
@@ -425,15 +421,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var dateStr = dateFmt.string(from: now)
         if let c = dateStr.first { dateStr = c.uppercased() + dateStr.dropFirst() }
 
-        // Time with blinking colons
-        colonVisible.toggle()
-        let cal = Calendar.current
-        let hr = cal.component(.hour, from: now)
-        let mn = cal.component(.minute, from: now)
-        let sc = cal.component(.second, from: now)
-
-        let img = renderStatusImage(up: upStr, down: downStr, dateStr: dateStr,
-                                    h: hr, m: mn, s: sc, colonVisible: colonVisible, height: barHeight)
+        let img = renderStatusImage(up: upStr, down: downStr, dateStr: dateStr, height: barHeight)
         statusItem.button?.image = img
 
         // CPU

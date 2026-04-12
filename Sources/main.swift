@@ -1,7 +1,7 @@
 import Cocoa
 import Darwin
 
-// MARK: - Network Stats
+// MARK: - Network
 
 struct NetworkSnapshot {
     let rx: UInt64
@@ -14,23 +14,19 @@ func getNetworkBytes() -> (rx: UInt64, tx: UInt64) {
     guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return (0, 0) }
     defer { freeifaddrs(firstAddr) }
 
-    var totalRx: UInt64 = 0
-    var totalTx: UInt64 = 0
+    var rx: UInt64 = 0, tx: UInt64 = 0
     var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
-
     while let addr = ptr {
         let name = String(cString: addr.pointee.ifa_name)
-        let family = addr.pointee.ifa_addr?.pointee.sa_family ?? 0
-        if family == UInt8(AF_LINK), name.hasPrefix("en") {
-            if let data = addr.pointee.ifa_data {
-                let ifData = data.assumingMemoryBound(to: if_data.self)
-                totalRx += UInt64(ifData.pointee.ifi_ibytes)
-                totalTx += UInt64(ifData.pointee.ifi_obytes)
-            }
+        if addr.pointee.ifa_addr?.pointee.sa_family == UInt8(AF_LINK), name.hasPrefix("en"),
+           let data = addr.pointee.ifa_data {
+            let d = data.assumingMemoryBound(to: if_data.self)
+            rx += UInt64(d.pointee.ifi_ibytes)
+            tx += UInt64(d.pointee.ifi_obytes)
         }
         ptr = addr.pointee.ifa_next
     }
-    return (totalRx, totalTx)
+    return (rx, tx)
 }
 
 func getLocalIP() -> String {
@@ -41,16 +37,11 @@ func getLocalIP() -> String {
     var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
     while let addr = ptr {
         let name = String(cString: addr.pointee.ifa_name)
-        let family = addr.pointee.ifa_addr?.pointee.sa_family ?? 0
-        if family == UInt8(AF_INET), name.hasPrefix("en") {
-            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            let result = getnameinfo(
-                addr.pointee.ifa_addr, socklen_t(addr.pointee.ifa_addr.pointee.sa_len),
-                &hostname, socklen_t(hostname.count),
-                nil, 0, NI_NUMERICHOST
-            )
-            if result == 0 {
-                let ip = String(cString: hostname)
+        if addr.pointee.ifa_addr?.pointee.sa_family == UInt8(AF_INET), name.hasPrefix("en") {
+            var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(addr.pointee.ifa_addr, socklen_t(addr.pointee.ifa_addr.pointee.sa_len),
+                           &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0 {
+                let ip = String(cString: buf)
                 if ip != "127.0.0.1" { return ip }
             }
         }
@@ -59,19 +50,17 @@ func getLocalIP() -> String {
     return "N/A"
 }
 
-// Fixed-width: always "X.X KB/s" or "XXX KB/s" or "X.X MB/s" etc
-func formatSpeed(_ bytesPerSec: Double) -> String {
-    let kb = bytesPerSec / 1024
-    let mb = kb / 1024
-    if mb >= 10    { return String(format: "%3.0f MB/s", mb) }
-    else if mb >= 1 { return String(format: "%3.1f MB/s", mb) }
+func formatSpeed(_ bps: Double) -> String {
+    let kb = bps / 1024, mb = kb / 1024
+    if mb >= 10      { return String(format: "%3.0f MB/s", mb) }
+    else if mb >= 1  { return String(format: "%3.1f MB/s", mb) }
     else if kb >= 10 { return String(format: "%3.0f KB/s", kb) }
     else             { return String(format: "%3.1f KB/s", kb) }
 }
 
 func formatBytes(_ bytes: UInt64) -> String {
     let gb = Double(bytes) / (1024 * 1024 * 1024)
-    if gb >= 1.0 { return String(format: "%.2f GB", gb) }
+    if gb >= 1 { return String(format: "%.2f GB", gb) }
     return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
 }
 
@@ -82,83 +71,59 @@ func countryFlag(_ code: String) -> String {
     }.map { Character($0) })
 }
 
-// MARK: - Status View (menu bar)
+// MARK: - Render menu bar image
 
-class StatusView: NSView {
-    // Speed: two small lines on the left
-    private let speedTop = NSTextField(labelWithString: "")
-    private let speedBot = NSTextField(labelWithString: "")
-    // Date+time: one normal line on the right, vertically centered
-    private let dateTime = NSTextField(labelWithString: "")
+func renderStatusImage(down: String, up: String, dateTime: String, height: CGFloat) -> NSImage {
+    let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+    let dateFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+    let color: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black]
 
-    override init(frame: NSRect) {
-        super.init(frame: frame)
+    let speedAttrs: [NSAttributedString.Key: Any] = [.font: speedFont].merging(color) { $1 }
+    let dateAttrs: [NSAttributedString.Key: Any] = [.font: dateFont].merging(color) { $1 }
 
-        let smallFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
-        let normalFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+    let downStr = "\u{2193} \(down)"
+    let upStr   = "\u{2191} \(up)"
 
-        for label in [speedTop, speedBot] {
-            label.font = smallFont
-            label.textColor = .headerTextColor
-            label.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(label)
-        }
+    let downSize = (downStr as NSString).size(withAttributes: speedAttrs)
+    let upSize   = (upStr as NSString).size(withAttributes: speedAttrs)
+    let dateSize = (dateTime as NSString).size(withAttributes: dateAttrs)
 
-        dateTime.font = normalFont
-        dateTime.textColor = .headerTextColor
-        dateTime.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(dateTime)
+    let speedW = max(downSize.width, upSize.width)
+    let gap: CGFloat = 5
+    let totalW = ceil(speedW + gap + dateSize.width)
 
-        NSLayoutConstraint.activate([
-            speedTop.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
-            speedTop.topAnchor.constraint(equalTo: topAnchor, constant: 1),
-            speedBot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
-            speedBot.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+    let img = NSImage(size: NSSize(width: totalW, height: height))
+    img.lockFocus()
 
-            dateTime.leadingAnchor.constraint(equalTo: speedTop.trailingAnchor, constant: 6),
-            dateTime.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dateTime.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
-        ])
+    // Speed: two lines stacked
+    let lineH = height / 2
+    (downStr as NSString).draw(at: NSPoint(x: 0, y: lineH + 1), withAttributes: speedAttrs)
+    (upStr as NSString).draw(at: NSPoint(x: 0, y: 1), withAttributes: speedAttrs)
 
-        speedTop.stringValue = "\u{2193}   0.0 KB/s"
-        speedBot.stringValue = "\u{2191}   0.0 KB/s"
-        dateTime.stringValue = "..."
-    }
+    // Date/time: one line, vertically centered, right of speed
+    let dateY = (height - dateSize.height) / 2
+    (dateTime as NSString).draw(at: NSPoint(x: speedW + gap, y: dateY), withAttributes: dateAttrs)
 
-    required init?(coder: NSCoder) { nil }
-
-    // Pass clicks through to the button underneath so the menu opens
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    func updateSpeed(down: String, up: String) {
-        speedTop.stringValue = "\u{2193} \(down)"
-        speedBot.stringValue = "\u{2191} \(up)"
-    }
-
-    func updateDateTime(_ str: String) {
-        dateTime.stringValue = str
-    }
+    img.unlockFocus()
+    img.isTemplate = true
+    return img
 }
 
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var statusView: StatusView!
     private var timer: Timer?
-    private var flagTimer: Timer?
     private var prevSnapshot: NetworkSnapshot?
+    private var barHeight: CGFloat = 22
 
     private var flagMenuItem: NSMenuItem!
     private var ipMenuItem: NSMenuItem!
-    private var extIPMenuItem: NSMenuItem!
     private var rxTotalItem: NSMenuItem!
     private var txTotalItem: NSMenuItem!
-
     private var currentExtIP = ""
-    private var currentFlag = ""
 
-    private let dateFormatter: DateFormatter = {
+    private let dateFmt: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ru_RU")
         f.dateFormat = "EE d MMM  HH:mm:ss"
@@ -168,45 +133,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let barHeight = NSStatusBar.system.thickness
-        statusItem = NSStatusBar.system.statusItem(withLength: 210)
-        statusView = StatusView(frame: NSRect(x: 0, y: 0, width: 210, height: barHeight))
-        statusItem.button?.addSubview(statusView)
-        statusView.frame = statusItem.button!.bounds
-        statusView.autoresizingMask = [.width, .height]
+        barHeight = NSStatusBar.system.thickness
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         buildMenu()
         startMonitoring()
         fetchGeoIP()
-
-        flagTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
-            self?.fetchGeoIP()
-        }
+        Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.fetchGeoIP() }
     }
 
     private func buildMenu() {
         let menu = NSMenu()
 
         // Calendar
-        let datePicker = NSDatePicker()
-        datePicker.datePickerStyle = .clockAndCalendar
-        datePicker.datePickerElements = .yearMonthDay
-        datePicker.dateValue = Date()
-        datePicker.isBezeled = false
-        datePicker.drawsBackground = false
-        datePicker.translatesAutoresizingMaskIntoConstraints = false
+        let dp = NSDatePicker()
+        dp.datePickerStyle = .clockAndCalendar
+        dp.datePickerElements = .yearMonthDay
+        dp.dateValue = Date()
+        dp.isBezeled = false
+        dp.drawsBackground = false
+        dp.frame = NSRect(x: 8, y: 4, width: 220, height: 180)
 
-        let calContainer = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 190))
-        calContainer.addSubview(datePicker)
-        datePicker.frame = NSRect(x: 10, y: 5, width: 220, height: 180)
-
+        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 236, height: 188))
+        calBox.addSubview(dp)
         let calItem = NSMenuItem()
-        calItem.view = calContainer
+        calItem.view = calBox
         menu.addItem(calItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // Flag + external IP
         flagMenuItem = NSMenuItem(title: "External IP: ...", action: #selector(copyExtIP), keyEquivalent: "")
         flagMenuItem.target = self
         menu.addItem(flagMenuItem)
@@ -227,62 +182,68 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let quitItem = NSMenuItem(title: "Quit NetMonitor", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quitItem)
+        let termItem = NSMenuItem(title: "Terminal", action: #selector(openTerminal), keyEquivalent: "t")
+        termItem.target = self
+        menu.addItem(termItem)
+
+        let actItem = NSMenuItem(title: "Activity Monitor", action: #selector(openActivityMonitor), keyEquivalent: "a")
+        actItem.target = self
+        menu.addItem(actItem)
+
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit NetMonitor", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         statusItem.menu = menu
     }
 
     private func startMonitoring() {
-        let bytes = getNetworkBytes()
-        prevSnapshot = NetworkSnapshot(rx: bytes.rx, tx: bytes.tx, timestamp: Date().timeIntervalSince1970)
+        let b = getNetworkBytes()
+        prevSnapshot = NetworkSnapshot(rx: b.rx, tx: b.tx, timestamp: Date().timeIntervalSince1970)
 
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateStats()
-        }
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer!, forMode: .common)
     }
 
-    private func updateStats() {
+    private func tick() {
         let now = Date()
         let ts = now.timeIntervalSince1970
-        let bytes = getNetworkBytes()
-        let current = NetworkSnapshot(rx: bytes.rx, tx: bytes.tx, timestamp: ts)
+        let b = getNetworkBytes()
+        let snap = NetworkSnapshot(rx: b.rx, tx: b.tx, timestamp: ts)
+
+        var downStr = "0.0 KB/s"
+        var upStr   = "0.0 KB/s"
 
         if let prev = prevSnapshot {
             let dt = ts - prev.timestamp
-            guard dt > 0 else { return }
-            let rxSpeed = Double(current.rx - prev.rx) / dt
-            let txSpeed = Double(current.tx - prev.tx) / dt
-            statusView.updateSpeed(down: formatSpeed(rxSpeed), up: formatSpeed(txSpeed))
-            rxTotalItem.title = "Total In:  \(formatBytes(current.rx))"
-            txTotalItem.title = "Total Out: \(formatBytes(current.tx))"
+            if dt > 0 {
+                downStr = formatSpeed(Double(snap.rx - prev.rx) / dt)
+                upStr   = formatSpeed(Double(snap.tx - prev.tx) / dt)
+                rxTotalItem.title = "Total In:  \(formatBytes(snap.rx))"
+                txTotalItem.title = "Total Out: \(formatBytes(snap.tx))"
+            }
         }
 
-        // Capitalize first letter of day name
-        var dateStr = dateFormatter.string(from: now)
-        if let first = dateStr.first {
-            dateStr = first.uppercased() + dateStr.dropFirst()
-        }
-        statusView.updateDateTime(dateStr)
+        var dateStr = dateFmt.string(from: now)
+        if let c = dateStr.first { dateStr = c.uppercased() + dateStr.dropFirst() }
+
+        let img = renderStatusImage(down: downStr, up: upStr, dateTime: dateStr, height: barHeight)
+        statusItem.button?.image = img
 
         ipMenuItem.title = "Local IP: \(getLocalIP())"
-        prevSnapshot = current
+        prevSnapshot = snap
     }
 
     private func fetchGeoIP() {
         guard let url = URL(string: "http://ip-api.com/json/?fields=query,countryCode") else { return }
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let code = json["countryCode"] as? String,
-                  let ip = json["query"] as? String
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let code = j["countryCode"] as? String,
+                  let ip = j["query"] as? String
             else { return }
-            let flag = countryFlag(code)
             DispatchQueue.main.async {
                 self?.currentExtIP = ip
-                self?.currentFlag = flag
-                self?.flagMenuItem.title = "\(flag) External IP: \(ip)"
+                self?.flagMenuItem.title = "\(countryFlag(code))  External IP: \(ip)"
             }
         }.resume()
     }
@@ -292,6 +253,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSPasteboard.general.setString(getLocalIP(), forType: .string)
     }
 
+    @objc private func openTerminal() {
+        NSWorkspace.shared.launchApplication("Terminal")
+    }
+
+    @objc private func openActivityMonitor() {
+        NSWorkspace.shared.launchApplication("Activity Monitor")
+    }
+
     @objc private func copyExtIP() {
         guard !currentExtIP.isEmpty else { return }
         NSPasteboard.general.clearContents()
@@ -299,7 +268,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Entry Point
+// MARK: - Entry
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

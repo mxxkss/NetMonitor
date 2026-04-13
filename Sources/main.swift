@@ -384,7 +384,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenu() {
         let menu = NSMenu()
-        menu.minimumWidth = 240
+        menu.minimumWidth = 280
 
         // Calendar
         let dp = NSDatePicker()
@@ -393,8 +393,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dp.dateValue = Date()
         dp.isBezeled = false
         dp.drawsBackground = false
-        dp.frame = NSRect(x: 4, y: 4, width: 310, height: 260)
-        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: 318, height: 268))
+        dp.sizeToFit()
+        let dpSize = dp.fittingSize
+        dp.frame = NSRect(x: 8, y: 8, width: dpSize.width, height: dpSize.height)
+        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: dpSize.width + 16, height: dpSize.height + 16))
         calBox.addSubview(dp)
         let calItem = NSMenuItem()
         calItem.view = calBox

@@ -594,8 +594,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var claude5hItem: NSMenuItem!
     private var claude7dItem: NSMenuItem!
     private var claudeLoginItem: NSMenuItem!
-    private var openaiBalanceItem: NSMenuItem!
-    private var openaiLoginItem: NSMenuItem!
     private var currentExtIP = ""
 
     private let dateFmt: DateFormatter = {
@@ -614,10 +612,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startMonitoring()
         fetchGeoIP()
         fetchClaudeUsage()
-        fetchOpenAIBalance()
         Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
             self?.fetchGeoIP()
-            self?.fetchOpenAIBalance()
         }
         Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in self?.fetchClaudeUsage() }
         // Monitor sleep/wake — common crash trigger
@@ -638,6 +634,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Log.shared.info("All timers scheduled, app running")
     }
 
+    private let infoFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+
+    private func makeInfoItem(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(noop), keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    @objc private func noop() {}
+
+    private func setInfoTitle(_ item: NSMenuItem, _ text: String) {
+        item.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [.font: infoFont, .foregroundColor: NSColor.labelColor]
+        )
+    }
+
     private func buildMenu() {
         let menu = NSMenu()
         menu.minimumWidth = 280
@@ -649,29 +662,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(calItem)
         menu.addItem(NSMenuItem.separator())
 
-        // System info — compact
-        cpuItem = NSMenuItem(title: "CPU:  ...", action: nil, keyEquivalent: "")
-        cpuItem.isEnabled = false
+        // System info — compact (using attributedTitle for readable text)
+        cpuItem = makeInfoItem("CPU:  ...")
         menu.addItem(cpuItem)
 
-        memItem = NSMenuItem(title: "RAM:  ...", action: nil, keyEquivalent: "")
-        memItem.isEnabled = false
+        memItem = makeInfoItem("RAM:  ...")
         menu.addItem(memItem)
 
-        battItem = NSMenuItem(title: "Battery:  ...", action: nil, keyEquivalent: "")
-        battItem.isEnabled = false
+        battItem = makeInfoItem("Battery:  ...")
         menu.addItem(battItem)
 
-        wifiItem = NSMenuItem(title: "Wi-Fi:  ...", action: nil, keyEquivalent: "")
-        wifiItem.isEnabled = false
+        wifiItem = makeInfoItem("Wi-Fi:  ...")
         menu.addItem(wifiItem)
 
-        diskItem = NSMenuItem(title: "Disk:  ...", action: nil, keyEquivalent: "")
-        diskItem.isEnabled = false
+        diskItem = makeInfoItem("Disk:  ...")
         menu.addItem(diskItem)
 
-        uptimeItem = NSMenuItem(title: "Uptime:  ...", action: nil, keyEquivalent: "")
-        uptimeItem.isEnabled = false
+        uptimeItem = makeInfoItem("Uptime:  ...")
         menu.addItem(uptimeItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -685,33 +692,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ipMenuItem.target = self
         menu.addItem(ipMenuItem)
 
-        rxTotalItem = NSMenuItem(title: "In: ...  Out: ...", action: nil, keyEquivalent: "")
-        rxTotalItem.isEnabled = false
+        rxTotalItem = makeInfoItem("In: ...  Out: ...")
         menu.addItem(rxTotalItem)
 
         menu.addItem(NSMenuItem.separator())
 
         // Claude Usage
-        claude5hItem = NSMenuItem(title: "Claude 5h: ...", action: nil, keyEquivalent: "")
-        claude5hItem.isEnabled = false
+        claude5hItem = makeInfoItem("Claude 5h: ...")
         menu.addItem(claude5hItem)
 
-        claude7dItem = NSMenuItem(title: "Claude 7d: ...", action: nil, keyEquivalent: "")
-        claude7dItem.isEnabled = false
+        claude7dItem = makeInfoItem("Claude 7d: ...")
         menu.addItem(claude7dItem)
 
         claudeLoginItem = NSMenuItem(title: "Claude: Set Session Key...", action: #selector(claudeLogin), keyEquivalent: "")
         claudeLoginItem.target = self
         menu.addItem(claudeLoginItem)
-
-        // OpenAI
-        openaiBalanceItem = NSMenuItem(title: "OpenAI: —", action: nil, keyEquivalent: "")
-        openaiBalanceItem.isEnabled = false
-        menu.addItem(openaiBalanceItem)
-
-        openaiLoginItem = NSMenuItem(title: "OpenAI: Set Session Token...", action: #selector(openaiLogin), keyEquivalent: "")
-        openaiLoginItem.target = self
-        menu.addItem(openaiLoginItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -758,7 +753,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let txDelta = snap.tx >= prev.tx ? snap.tx - prev.tx : snap.tx
                 downStr = formatSpeed(Double(rxDelta) / dt)
                 upStr   = formatSpeed(Double(txDelta) / dt)
-                rxTotalItem.title = "In: \(formatBytes(snap.rx))  Out: \(formatBytes(snap.tx))"
+                setInfoTitle(rxTotalItem, "In: \(formatBytes(snap.rx))  Out: \(formatBytes(snap.tx))")
             }
         }
 
@@ -781,16 +776,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let cores = cpuMonitor.perCoreUsage()
         let blocks: [Character] = ["\u{2581}", "\u{2582}", "\u{2583}", "\u{2584}", "\u{2585}", "\u{2586}", "\u{2587}", "\u{2588}"]
         let bars = cores.map { blocks[min(Int($0 / 12.5), 7)] }
-        cpuItem.title = String(format: "CPU  %3.0f%%  %@", cpu, String(bars))
+        setInfoTitle(cpuItem, String(format: "CPU  %3.0f%%  %@", cpu, String(bars)))
 
         // Memory
         let mem = getMemoryUsage()
-        memItem.title = String(format: "RAM  %.1f / %.0f GB  (%.0f%%)", mem.used, mem.total, mem.pct)
+        setInfoTitle(memItem, String(format: "RAM  %.1f / %.0f GB  (%.0f%%)", mem.used, mem.total, mem.pct))
 
         // Battery
         if let batt = getBatteryInfo() {
             let chargeIcon = batt.charging ? "\u{26A1}" : ""
-            battItem.title = String(format: "Bat  %d%% %@ cyc:%d hlth:%d%%", batt.level, chargeIcon, batt.cycleCount, batt.health)
+            setInfoTitle(battItem, String(format: "Bat  %d%% %@ cyc:%d hlth:%d%%", batt.level, chargeIcon, batt.cycleCount, batt.health))
             battItem.isHidden = false
         } else {
             battItem.isHidden = true // desktop Mac — no battery
@@ -798,15 +793,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Wi-Fi
         if let wifi = getWiFiInfo() {
-            wifiItem.title = "Wi-Fi  \(wifi.ssid)  \(signalBars(wifi.rssi))  \(wifi.rssi)dBm"
+            setInfoTitle(wifiItem, "Wi-Fi  \(wifi.ssid)  \(signalBars(wifi.rssi))  \(wifi.rssi)dBm")
         } else {
-            wifiItem.title = "Wi-Fi  Not connected"
+            setInfoTitle(wifiItem, "Wi-Fi  Not connected")
         }
 
         // Disk & Uptime
         let disk = getDiskUsage()
-        diskItem.title = String(format: "Disk  %.0f / %.0f GB", disk.used, disk.total)
-        uptimeItem.title = "Up  \(getUptime())"
+        setInfoTitle(diskItem, String(format: "Disk  %.0f / %.0f GB", disk.used, disk.total))
+        setInfoTitle(uptimeItem, "Up  \(getUptime())")
 
         ipMenuItem.title = "Local IP: \(getLocalIP())"
         prevSnapshot = snap
@@ -838,8 +833,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else if response == .alertThirdButtonReturn {
             keychainDelete(key: "sessionKey")
             keychainDelete(key: "orgId")
-            claude5hItem.title = "Claude 5h: —"
-            claude7dItem.title = "Claude 7d: —"
+            setInfoTitle(claude5hItem, "Claude 5h: —")
+            setInfoTitle(claude7dItem, "Claude 7d: —")
         }
     }
 
@@ -862,7 +857,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                   let orgId = first["uuid"] as? String
             else {
                 Log.shared.warn("fetchOrgId: failed to parse orgs response")
-                DispatchQueue.main.async { self?.claude5hItem.title = "Claude 5h: Bad key" }
+                DispatchQueue.main.async { [weak self] in guard let self else { return }; self.setInfoTitle(self.claude5hItem, "Claude 5h: Bad key") }
                 return
             }
             keychainSave(key: "orgId", value: orgId)
@@ -882,9 +877,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
               let orgId = keychainLoad(key: "orgId"),
               let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/usage")
         else {
-            DispatchQueue.main.async {
-                self.claude5hItem.title = "Claude 5h: —"
-                self.claude7dItem.title = "Claude 7d: —"
+            DispatchQueue.main.async { [self] in
+                self.setInfoTitle(self.claude5hItem, "Claude 5h: —")
+                self.setInfoTitle(self.claude7dItem, "Claude 7d: —")
             }
             return
         }
@@ -900,7 +895,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if let http = resp as? HTTPURLResponse, http.statusCode == 403 || http.statusCode == 401 {
                 Log.shared.warn("fetchClaudeUsage: session expired (HTTP \(http.statusCode))")
-                DispatchQueue.main.async { self?.claude5hItem.title = "Claude 5h: Session expired" }
+                DispatchQueue.main.async { [weak self] in guard let self else { return }; self.setInfoTitle(self.claude5hItem, "Claude 5h: Session expired") }
                 return
             }
             self?.parseUsageResponse(data)
@@ -954,15 +949,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         else { return }
 
         DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             if let fiveH = j["five_hour"] as? [String: Any],
                let u5 = fiveH["utilization"] as? Double {
-                let reset = self?.parseResetTime(fiveH["resets_at"] as? String, short: true) ?? ""
-                self?.claude5hItem.title = String(format: "Claude 5h: %.0f%%%@", u5, reset)
+                let reset = self.parseResetTime(fiveH["resets_at"] as? String, short: true)
+                self.setInfoTitle(self.claude5hItem, String(format: "Claude 5h: %.0f%%%@", u5, reset))
             }
             if let sevenD = j["seven_day"] as? [String: Any],
                let u7 = sevenD["utilization"] as? Double {
-                let reset = self?.parseResetTime(sevenD["resets_at"] as? String, short: false) ?? ""
-                self?.claude7dItem.title = String(format: "Claude 7d: %.0f%%%@", u7, reset)
+                let reset = self.parseResetTime(sevenD["resets_at"] as? String, short: false)
+                self.setInfoTitle(self.claude7dItem, String(format: "Claude 7d: %.0f%%%@", u7, reset))
             }
         }
     }
@@ -978,128 +974,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "  \u{21BB}\(rf.string(from: d))"
     }
 
-    // MARK: - OpenAI Balance (via session token from Safari)
 
-    @objc private func openaiLogin() {
-        let alert = NSAlert()
-        alert.messageText = "OpenAI Session Token"
-        alert.informativeText = "1. Open platform.openai.com in Safari, log in\n2. Safari → Develop → Show Web Inspector\n3. Tab \"Storage\" → Cookies → platform.openai.com\n4. Copy \"__Secure-next-auth.session-token\" value"
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Remove")
-
-        let keyField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        keyField.placeholderString = "eyJ..."
-        keyField.stringValue = keychainLoad(key: "openai-session") ?? ""
-        alert.accessoryView = keyField
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
-            if !key.isEmpty {
-                keychainSave(key: "openai-session", value: key)
-                fetchOpenAIBalance()
-            }
-        } else if response == .alertThirdButtonReturn {
-            keychainDelete(key: "openai-session")
-            openaiBalanceItem.title = "OpenAI: —"
-        }
-    }
-
-    private func fetchOpenAIBalance() {
-        guard let session = keychainLoad(key: "openai-session") else {
-            DispatchQueue.main.async { self.openaiBalanceItem.title = "OpenAI: —" }
-            return
-        }
-
-        // First get access token via /api/auth/session
-        guard let url = URL(string: "https://platform.openai.com/api/auth/session") else { return }
-        var req = URLRequest(url: url)
-        req.setValue("__Secure-next-auth.session-token=\(session)", forHTTPHeaderField: "Cookie")
-        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
-
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
-            if let error = error {
-                Log.shared.error("fetchOpenAIBalance session error: \(error.localizedDescription)")
-                return
-            }
-            // Try to extract accessToken from session response
-            if let data = data,
-               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let token = j["accessToken"] as? String {
-                self?.fetchOpenAICreditGrants(accessToken: token)
-                return
-            }
-
-            // If no accessToken, try using session cookie directly on billing
-            self?.fetchOpenAICreditGrants(sessionCookie: session)
-        }.resume()
-    }
-
-    private func fetchOpenAICreditGrants(accessToken: String? = nil, sessionCookie: String? = nil) {
-        guard let url = URL(string: "https://api.openai.com/dashboard/billing/credit_grants") else { return }
-        var req = URLRequest(url: url)
-        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
-
-        if let token = accessToken {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        } else if let cookie = sessionCookie {
-            req.setValue("__Secure-next-auth.session-token=\(cookie)", forHTTPHeaderField: "Cookie")
-        }
-
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
-            if let http = resp as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
-                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: session expired" }
-                return
-            }
-
-            guard let data = data,
-                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let total = j["total_available"] as? Double
-            else {
-                // Fallback: try subscription endpoint
-                if let token = accessToken {
-                    self?.fetchOpenAISubscription(accessToken: token)
-                } else {
-                    DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: no data" }
-                }
-                return
-            }
-
-            DispatchQueue.main.async {
-                self?.openaiBalanceItem.title = String(format: "OpenAI: $%.2f", total)
-            }
-        }.resume()
-    }
-
-    private func fetchOpenAISubscription(accessToken: String) {
-        guard let url = URL(string: "https://api.openai.com/dashboard/billing/subscription") else { return }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
-
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let data = data,
-                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else {
-                DispatchQueue.main.async { self?.openaiBalanceItem.title = "OpenAI: no data" }
-                return
-            }
-
-            let limit = j["hard_limit_usd"] as? Double
-            let plan = (j["plan"] as? [String: Any])?["title"] as? String
-
-            DispatchQueue.main.async {
-                if let limit = limit, limit > 0 {
-                    self?.openaiBalanceItem.title = String(format: "OpenAI: limit $%.0f", limit)
-                } else if let plan = plan {
-                    self?.openaiBalanceItem.title = "OpenAI: \(plan)"
-                } else {
-                    self?.openaiBalanceItem.title = "OpenAI: \u{2713} connected"
-                }
-            }
-        }.resume()
-    }
 
     // MARK: - GeoIP
 

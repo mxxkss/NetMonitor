@@ -554,19 +554,18 @@ func renderStatusImage(up: String, down: String, dateStr: String, height: CGFloa
     let speedW = max(upSize.width, downSize.width)
     let gap: CGFloat = 5
     let totalW = ceil(speedW + gap + dateSize.width + 1)
+    let size = NSSize(width: totalW, height: height)
 
-    let img = NSImage(size: NSSize(width: totalW, height: height))
-    img.lockFocus()
+    let img = NSImage(size: size, flipped: false) { _ in
+        let lineH = height / 2
+        (upStr as NSString).draw(at: NSPoint(x: 0, y: lineH + 1), withAttributes: speedAttrs)
+        (downStr as NSString).draw(at: NSPoint(x: 0, y: 1), withAttributes: speedAttrs)
 
-    let lineH = height / 2
-    (upStr as NSString).draw(at: NSPoint(x: 0, y: lineH + 1), withAttributes: speedAttrs)
-    (downStr as NSString).draw(at: NSPoint(x: 0, y: 1), withAttributes: speedAttrs)
-
-    let dtX = speedW + gap
-    let dateY = (height - dateSize.height) / 2
-    (dateStr as NSString).draw(at: NSPoint(x: dtX, y: dateY), withAttributes: dateAttrs)
-
-    img.unlockFocus()
+        let dtX = speedW + gap
+        let dateY = (height - dateSize.height) / 2
+        (dateStr as NSString).draw(at: NSPoint(x: dtX, y: dateY), withAttributes: dateAttrs)
+        return true
+    }
     img.isTemplate = false
     return img
 }

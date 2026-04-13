@@ -4,6 +4,91 @@ import CoreWLAN
 import Security
 import IOKit
 
+// MARK: - Logger
+
+final class Log {
+    static let shared = Log()
+    private let handle: FileHandle?
+    private let queue = DispatchQueue(label: "netmonitor.log", qos: .utility)
+    let path: String
+
+    private init() {
+        let dir = NSHomeDirectory() + "/Library/Logs/NetMonitor"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        path = dir + "/netmonitor.log"
+
+        // Rotate if > 1MB
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let size = attrs[.size] as? UInt64, size > 1_000_000 {
+            let old = dir + "/netmonitor.old.log"
+            try? FileManager.default.removeItem(atPath: old)
+            try? FileManager.default.moveItem(atPath: path, toPath: old)
+        }
+
+        FileManager.default.createFile(atPath: path, contents: nil)
+        handle = FileHandle(forWritingAtPath: path)
+        handle?.seekToEndOfFile()
+    }
+
+    func write(_ msg: String, level: String = "INFO") {
+        queue.async { [weak self] in
+            let ts = ISO8601DateFormatter().string(from: Date())
+            let line = "[\(ts)] [\(level)] \(msg)\n"
+            if let data = line.data(using: .utf8) {
+                self?.handle?.write(data)
+            }
+        }
+    }
+
+    func info(_ msg: String) { write(msg, level: "INFO") }
+    func warn(_ msg: String) { write(msg, level: "WARN") }
+    func error(_ msg: String) { write(msg, level: "ERROR") }
+    func fatal(_ msg: String) { write(msg, level: "FATAL") }
+}
+
+// MARK: - Crash Handlers
+
+private func writeCrashLog(_ msg: String) {
+    // Async-signal-safe: open/write/close only
+    let path = NSHomeDirectory() + "/Library/Logs/NetMonitor/crash.log"
+    guard let cPath = path.cString(using: .utf8) else { return }
+    let fd = Darwin.open(cPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard fd >= 0 else { return }
+    msg.utf8CString.withUnsafeBufferPointer { buf in
+        _ = Darwin.write(fd, buf.baseAddress, buf.count - 1) // exclude null terminator
+    }
+    _ = Darwin.write(fd, "\n", 1)
+    Darwin.close(fd)
+}
+
+func installCrashHandlers() {
+    NSSetUncaughtExceptionHandler { exception in
+        let msg = "[FATAL] Uncaught exception: \(exception.name.rawValue) — \(exception.reason ?? "no reason")\nStack: \(exception.callStackSymbols.joined(separator: "\n"))"
+        Log.shared.fatal(msg)
+        writeCrashLog(msg)
+    }
+
+    for sig: Int32 in [SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGTRAP] {
+        signal(sig) { s in
+            writeCrashLog("[FATAL] Signal \(s) received")
+            signal(s, SIG_DFL)
+            raise(s)
+        }
+    }
+}
+
+func getAppMemoryMB() -> String {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+    let r = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    guard r == KERN_SUCCESS else { return "?" }
+    return String(format: "%.1f", Double(info.resident_size) / (1024 * 1024))
+}
+
 // MARK: - Calendar View
 
 class CalendarView: NSView {
@@ -101,7 +186,7 @@ class CalendarView: NSView {
         let gridTop = bounds.height - padding - headerHeight - weekdayHeaderHeight
 
         // Previous month trailing days
-        let prevMonthDate = cal.date(byAdding: .month, value: -1, to: firstDate)!
+        guard let prevMonthDate = cal.date(byAdding: .month, value: -1, to: firstDate) else { return }
         let prevMonthDays = cal.range(of: .day, in: .month, for: prevMonthDate)?.count ?? 30
         let dimAttrs: [NSAttributedString.Key: Any] = [.font: dayFont, .foregroundColor: NSColor.tertiaryLabelColor]
         for i in 0..<weekday {
@@ -412,7 +497,10 @@ func getBatteryInfo() -> BatteryInfo? {
 let keychainService = "team.skazka.netmonitor"
 
 func keychainSave(key: String, value: String) {
-    let data = value.data(using: .utf8)!
+    guard let data = value.data(using: .utf8) else {
+        Log.shared.error("keychainSave: failed to encode value for key '\(key)'")
+        return
+    }
     let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                              kSecAttrService as String: keychainService,
                              kSecAttrAccount as String: key,
@@ -518,6 +606,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.shared.info("=== NetMonitor starting (pid: \(ProcessInfo.processInfo.processIdentifier)) ===")
         NSApp.setActivationPolicy(.accessory)
         barHeight = NSStatusBar.system.thickness
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -531,6 +620,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.fetchOpenAIBalance()
         }
         Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in self?.fetchClaudeUsage() }
+        // Monitor sleep/wake — common crash trigger
+        let wsnc = NSWorkspace.shared.notificationCenter
+        wsnc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
+            Log.shared.info("System going to sleep")
+        }
+        wsnc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Log.shared.info("System woke up — resetting network snapshot")
+            // Reset snapshot to avoid UInt64 delta issues after sleep
+            let b = getNetworkBytes()
+            self?.prevSnapshot = NetworkSnapshot(rx: b.rx, tx: b.tx, timestamp: Date().timeIntervalSince1970)
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main) { _ in
+            Log.shared.info("System shutting down / logging out")
+        }
+
+        Log.shared.info("All timers scheduled, app running")
     }
 
     private func buildMenu() {
@@ -635,7 +740,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         RunLoop.main.add(timer!, forMode: .common)
     }
 
+    private var tickCount: UInt64 = 0
+
     private func tick() {
+        tickCount += 1
         let now = Date()
         let ts = now.timeIntervalSince1970
         let b = getNetworkBytes()
@@ -645,10 +753,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let prev = prevSnapshot {
             let dt = ts - prev.timestamp
             if dt > 0 {
-                downStr = formatSpeed(Double(snap.rx - prev.rx) / dt)
-                upStr   = formatSpeed(Double(snap.tx - prev.tx) / dt)
+                // Guard against counter reset (e.g. wake from sleep)
+                let rxDelta = snap.rx >= prev.rx ? snap.rx - prev.rx : snap.rx
+                let txDelta = snap.tx >= prev.tx ? snap.tx - prev.tx : snap.tx
+                downStr = formatSpeed(Double(rxDelta) / dt)
+                upStr   = formatSpeed(Double(txDelta) / dt)
                 rxTotalItem.title = "In: \(formatBytes(snap.rx))  Out: \(formatBytes(snap.tx))"
             }
+        }
+
+        // Log every 150 ticks (~5 min) as heartbeat
+        if tickCount % 150 == 0 {
+            Log.shared.info("heartbeat tick=\(tickCount) appMem=\(getAppMemoryMB())MB")
         }
 
         // Date
@@ -733,12 +849,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         req.setValue("sessionKey=\(sessionKey)", forHTTPHeaderField: "Cookie")
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
+            if let error = error {
+                Log.shared.error("fetchOrgId network error: \(error.localizedDescription)")
+            }
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                Log.shared.warn("fetchOrgId HTTP \(http.statusCode)")
+            }
             guard let data = data,
                   let orgs = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
                   let first = orgs.first,
                   let orgId = first["uuid"] as? String
             else {
+                Log.shared.warn("fetchOrgId: failed to parse orgs response")
                 DispatchQueue.main.async { self?.claude5hItem.title = "Claude 5h: Bad key" }
                 return
             }
@@ -770,8 +893,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         req.setValue("sessionKey=\(sessionKey)", forHTTPHeaderField: "Cookie")
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
+            if let error = error {
+                Log.shared.error("fetchClaudeUsage(session) error: \(error.localizedDescription)")
+                return
+            }
             if let http = resp as? HTTPURLResponse, http.statusCode == 403 || http.statusCode == 401 {
+                Log.shared.warn("fetchClaudeUsage: session expired (HTTP \(http.statusCode))")
                 DispatchQueue.main.async { self?.claude5hItem.title = "Claude 5h: Session expired" }
                 return
             }
@@ -808,7 +936,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
+            if let error = error {
+                Log.shared.error("fetchUsageOAuth error: \(error.localizedDescription)")
+                return
+            }
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                Log.shared.warn("fetchUsageOAuth HTTP \(http.statusCode)")
+            }
             self?.parseUsageResponse(data)
         }.resume()
     }
@@ -883,7 +1018,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         req.setValue("__Secure-next-auth.session-token=\(session)", forHTTPHeaderField: "Cookie")
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
+            if let error = error {
+                Log.shared.error("fetchOpenAIBalance session error: \(error.localizedDescription)")
+                return
+            }
             // Try to extract accessToken from session response
             if let data = data,
                let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -968,12 +1107,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = URL(string: "https://ipapi.co/json/") else { return }
         var req = URLRequest(url: url)
         req.setValue("NetMonitor/1.0", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
+            if let error = error {
+                Log.shared.error("fetchGeoIP error: \(error.localizedDescription)")
+                return
+            }
             guard let data = data,
                   let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let code = j["country_code"] as? String,
                   let ip = j["ip"] as? String
-            else { return }
+            else {
+                Log.shared.warn("fetchGeoIP: failed to parse response")
+                return
+            }
             DispatchQueue.main.async {
                 self?.currentExtIP = ip
                 self?.flagMenuItem.title = "\(countryFlag(code)) External IP: \(ip)"
@@ -1000,7 +1146,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Entry
 
+installCrashHandlers()
+Log.shared.info("=== Process start, installing crash handlers ===")
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
+
+// If we get here, app exited normally
+Log.shared.info("=== NSApplication.run() returned — normal exit ===")

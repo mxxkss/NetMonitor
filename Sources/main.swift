@@ -4,6 +4,159 @@ import CoreWLAN
 import Security
 import IOKit
 
+// MARK: - Calendar View
+
+class CalendarView: NSView {
+    private var displayedMonth: Date
+    private let cellSize: CGFloat = 36
+    private let headerHeight: CGFloat = 32
+    private let weekdayHeaderHeight: CGFloat = 24
+    private let padding: CGFloat = 8
+    private let cols = 7
+
+    private var prevButton: NSButton!
+    private var nextButton: NSButton!
+
+    override var intrinsicContentSize: NSSize {
+        let w = padding * 2 + cellSize * CGFloat(cols)
+        let h = padding + headerHeight + weekdayHeaderHeight + cellSize * 6 + padding
+        return NSSize(width: w, height: h)
+    }
+
+    init() {
+        self.displayedMonth = Date()
+        let size = NSSize(width: 8 * 2 + 36 * 7, height: 8 + 32 + 24 + 36 * 6 + 8)
+        super.init(frame: NSRect(origin: .zero, size: size))
+
+        prevButton = makeNavButton(title: "\u{25C0}", action: #selector(prevMonth))
+        nextButton = makeNavButton(title: "\u{25B6}", action: #selector(nextMonth))
+        addSubview(prevButton)
+        addSubview(nextButton)
+        layoutNavButtons()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func makeNavButton(title: String, action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.isBordered = false
+        b.font = NSFont.systemFont(ofSize: 13)
+        b.sizeToFit()
+        return b
+    }
+
+    private func layoutNavButtons() {
+        let w = frame.width
+        prevButton.frame.origin = NSPoint(x: w - 60, y: frame.height - padding - headerHeight + 4)
+        nextButton.frame.origin = NSPoint(x: w - 32, y: frame.height - padding - headerHeight + 4)
+    }
+
+    @objc private func prevMonth() {
+        displayedMonth = Calendar.current.date(byAdding: .month, value: -1, to: displayedMonth) ?? displayedMonth
+        needsDisplay = true
+    }
+
+    @objc private func nextMonth() {
+        displayedMonth = Calendar.current.date(byAdding: .month, value: 1, to: displayedMonth) ?? displayedMonth
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let cal = Calendar(identifier: .gregorian)
+        let today = Date()
+
+        // Month/year header
+        let comps = cal.dateComponents([.year, .month], from: displayedMonth)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "ru_RU")
+        fmt.dateFormat = "LLLL yyyy"
+        let title = fmt.string(from: displayedMonth).prefix(1).uppercased() + fmt.string(from: displayedMonth).dropFirst()
+        let titleFont = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        let titleAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .foregroundColor: NSColor.labelColor]
+        let titleY = bounds.height - padding - headerHeight + 6
+        (title as NSString).draw(at: NSPoint(x: padding, y: titleY), withAttributes: titleAttrs)
+
+        // Weekday headers
+        let weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        let wdFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let wdAttrs: [NSAttributedString.Key: Any] = [.font: wdFont, .foregroundColor: NSColor.secondaryLabelColor]
+        let wdY = bounds.height - padding - headerHeight - weekdayHeaderHeight + 4
+        for (i, wd) in weekdays.enumerated() {
+            let x = padding + CGFloat(i) * cellSize
+            let size = (wd as NSString).size(withAttributes: wdAttrs)
+            let centeredX = x + (cellSize - size.width) / 2
+            (wd as NSString).draw(at: NSPoint(x: centeredX, y: wdY), withAttributes: wdAttrs)
+        }
+
+        // Calculate first day of month
+        var firstOfMonth = DateComponents()
+        firstOfMonth.year = comps.year
+        firstOfMonth.month = comps.month
+        firstOfMonth.day = 1
+        guard let firstDate = cal.date(from: firstOfMonth) else { return }
+        var weekday = cal.component(.weekday, from: firstDate) - 2 // Monday = 0
+        if weekday < 0 { weekday += 7 }
+        let daysInMonth = cal.range(of: .day, in: .month, for: firstDate)?.count ?? 30
+
+        let dayFont = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .regular)
+        let gridTop = bounds.height - padding - headerHeight - weekdayHeaderHeight
+
+        // Previous month trailing days
+        let prevMonthDate = cal.date(byAdding: .month, value: -1, to: firstDate)!
+        let prevMonthDays = cal.range(of: .day, in: .month, for: prevMonthDate)?.count ?? 30
+        let dimAttrs: [NSAttributedString.Key: Any] = [.font: dayFont, .foregroundColor: NSColor.tertiaryLabelColor]
+        for i in 0..<weekday {
+            let day = prevMonthDays - weekday + 1 + i
+            let col = i
+            let row = 0
+            let x = padding + CGFloat(col) * cellSize
+            let y = gridTop - CGFloat(row + 1) * cellSize
+            drawDay("\(day)", in: NSRect(x: x, y: y, width: cellSize, height: cellSize), attrs: dimAttrs, isToday: false)
+        }
+
+        // Current month days
+        let todayComps = cal.dateComponents([.year, .month, .day], from: today)
+        for day in 1...daysInMonth {
+            let pos = weekday + day - 1
+            let col = pos % 7
+            let row = pos / 7
+            let x = padding + CGFloat(col) * cellSize
+            let y = gridTop - CGFloat(row + 1) * cellSize
+
+            let isToday = todayComps.year == comps.year && todayComps.month == comps.month && todayComps.day == day
+            let isWeekend = col >= 5
+            let color: NSColor = isToday ? .white : isWeekend ? .systemOrange : .labelColor
+            let attrs: [NSAttributedString.Key: Any] = [.font: dayFont, .foregroundColor: color]
+            drawDay("\(day)", in: NSRect(x: x, y: y, width: cellSize, height: cellSize), attrs: attrs, isToday: isToday)
+        }
+
+        // Next month leading days
+        let totalCells = weekday + daysInMonth
+        let remaining = (7 - totalCells % 7) % 7
+        for i in 0..<remaining {
+            let pos = totalCells + i
+            let col = pos % 7
+            let row = pos / 7
+            let x = padding + CGFloat(col) * cellSize
+            let y = gridTop - CGFloat(row + 1) * cellSize
+            drawDay("\(i + 1)", in: NSRect(x: x, y: y, width: cellSize, height: cellSize), attrs: dimAttrs, isToday: false)
+        }
+    }
+
+    private func drawDay(_ text: String, in rect: NSRect, attrs: [NSAttributedString.Key: Any], isToday: Bool) {
+        if isToday {
+            let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 4, dy: 4))
+            NSColor.systemBlue.setFill()
+            circle.fill()
+        }
+        let size = (text as NSString).size(withAttributes: attrs)
+        let x = rect.midX - size.width / 2
+        let y = rect.midY - size.height / 2
+        (text as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
+    }
+}
+
 // MARK: - Network
 
 struct NetworkSnapshot {
@@ -387,19 +540,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.minimumWidth = 280
 
         // Calendar
-        let dp = NSDatePicker()
-        dp.datePickerStyle = .clockAndCalendar
-        dp.datePickerElements = .yearMonthDay
-        dp.dateValue = Date()
-        dp.isBezeled = false
-        dp.drawsBackground = false
-        dp.sizeToFit()
-        let dpSize = dp.fittingSize
-        dp.frame = NSRect(x: 8, y: 8, width: dpSize.width, height: dpSize.height)
-        let calBox = NSView(frame: NSRect(x: 0, y: 0, width: dpSize.width + 16, height: dpSize.height + 16))
-        calBox.addSubview(dp)
+        let calView = CalendarView()
         let calItem = NSMenuItem()
-        calItem.view = calBox
+        calItem.view = calView
         menu.addItem(calItem)
         menu.addItem(NSMenuItem.separator())
 

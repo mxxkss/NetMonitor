@@ -18,16 +18,12 @@ class CalendarView: NSView {
     private var nextButton: NSButton!
 
     override var intrinsicContentSize: NSSize {
-        let w = padding * 2 + cellSize * CGFloat(cols)
-        let h = padding + headerHeight + weekdayHeaderHeight + cellSize * 6 + padding
-        return NSSize(width: w, height: h)
+        return NSSize(width: 268, height: 280)
     }
 
     init() {
         self.displayedMonth = Date()
-        let w: CGFloat = 8 * 2 + 36 * 7
-        let h: CGFloat = 8 + 32 + 24 + 36 * 6 + 8
-        let size = NSSize(width: w, height: h)
+        let size = NSSize(width: 268, height: 280)
         super.init(frame: NSRect(origin: .zero, size: size))
 
         prevButton = makeNavButton(title: "\u{25C0}", action: #selector(prevMonth))
